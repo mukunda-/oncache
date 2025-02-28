@@ -1,0 +1,26 @@
+Encryption protocol
+===================
+
+The network uses AES-CBC encryption to secure communication between the nodes. A shared
+secret is provided during initialization. All nodes must have access to the same shared
+secret in order to communicate. The shared secret length controls the encryption strength.
+Weaker keys are more performant.
+
+16-byte secret : AES-128
+24-byte secret : AES-192
+32-byte secret : AES-256
+
+When connecting, there is a short header:
+
+[4 bytes] Version info. Currently "ON_1"
+[16 bytes] IV/nonce. A random nonce to seed the CBC cipher. 
+
+Data after this point is encrypted.
+
+[32 bytes] SHA-256 hash of the shared secret. This is used to confirm that the remote
+           sender is using the same key. If this is incorrect, the connection is dropped.
+
+[16 bytes...] Stream data. Stream chunks are padded with NUL bytes to a multiple of 16.
+              (AES block size) using NUL. After decryption, NUL bytes are discarded.
+
+... Repeat until connection closes ...
