@@ -10,17 +10,46 @@ package oncache
 
 import (
 	"fmt"
+	"runtime/debug"
 	"strings"
+	"sync"
+	"time"
 )
+
+type Unixtime = int64
+
+type signal struct {
+	C      chan struct{}
+	closer sync.Once
+}
+
+func (s *signal) wait() {
+	<-s.C
+}
+
+func (s *signal) raise() {
+	s.closer.Do(func() {
+		close(s.C)
+	})
+}
+
+func (s *signal) raised() bool {
+	select {
+	case <-s.C:
+		return true
+	default:
+		return false
+	}
+}
 
 var networkPort = 7750
 var myHosts []string
 var encryptionKey []byte
 var initCalled bool
-var shutdownSignal chan struct{}
-var shutdownComplete chan struct{}
+var shutdownSignal signal
+var workWaitGroup sync.WaitGroup
 
-// Set the port to communicate on. This can be called at any time. The default port is
+// Set the port to communicate on. This should be called before init. The default port is
 // 7750.
 func SetPort(port int) {
 	networkPort = port
@@ -40,8 +69,7 @@ func Connect(hosts []string) {
 	myHosts = hosts
 }
 
-// Invalidate a key prefix.
-func Invalidate(key string) {
+func invalidateLocal(key string) {
 	cacheName, key, found := strings.Cut(key, "/")
 	if !found {
 		// Invalid key.
@@ -55,13 +83,17 @@ func Invalidate(key string) {
 	}
 
 	cache.Delete(key)
+}
 
-	DispatchMessage("DELETE " + key)
+// Invalidate a key prefix.
+func Invalidate(key string) {
+	invalidateLocal(key)
+	DispatchMessage("1", "DEL "+key)
 }
 
 // This must be called during initialization. This sets the encryption key used between
 // nodes. All nodes must use the same key to communicate. The key should be 16, 24, or 32
-// crypto-random bytes.
+// crypto-random bytes. This can be called again later to change the key.
 func Init(key []byte) error {
 	if len(key) != 16 && len(key) != 24 && len(key) != 32 {
 		return ErrInvalidKey
@@ -71,32 +103,36 @@ func Init(key []byte) error {
 	logInfo(fmt.Sprintf("keysize = %d", len(key)))
 	encryptionKey = key
 	initCalled = true
-	shutdownSignal = make(chan struct{})
-	shutdownComplete = make(chan struct{})
+	shutdownSignal = signal{C: make(chan struct{})}
+	workWaitGroup.Add(2)
 
-	go messageLoop()
+	go messageSendProcess(&workWaitGroup)
+	go listenerProcess(&workWaitGroup)
 	return nil
 }
 
+// Shut down the system. Called during application teardown. This will block until related
+// goroutines quit.
 func Shutdown() {
-	select {
-	case <-shutdownSignal:
-	default:
-		close(shutdownSignal)
-	}
+	shutdownSignal.raise()
+	workWaitGroup.Wait()
 
-	<-shutdownComplete
 }
 
-func messageLoop() {
-	defer close(shutdownComplete)
-
-	for {
+func catchProcessPanic(name string, wg *sync.WaitGroup, process func()) {
+	if r := recover(); r != nil {
+		logError(fmt.Sprintf("[%s] recovered from panic: %v; restarting in 60 seconds", name, r))
+		logError(string(debug.Stack()))
 		select {
-		case message := <-messageQueue:
-			handleMessage(message)
-		case <-shutdownSignal:
+		case <-time.After(time.Second * 60):
+			process()
+		case <-shutdownSignal.C:
+			logInfo("[%s] Shutdown signal received. Cancelling restart.")
+			wg.Done()
 			return
 		}
+		process()
+	} else {
+		wg.Done()
 	}
 }
