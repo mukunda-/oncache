@@ -8,6 +8,9 @@
 all:
 	@echo "Nothing to do. This project does not have artifacts."
 
+test:
+	go test ./...
+
 # Generate test coverage report coverage.html
 cover:
 	go test -v -coverprofile coverage ./...

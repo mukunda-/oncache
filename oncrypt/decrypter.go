@@ -134,7 +134,7 @@ retry:
 // Errors:
 // - ErrInitFailed: invalid args or invalid stream data
 // - ErrKeyMismatch: stream was not encrypted with the same key
-func DecryptStream(key []byte, stream io.Reader) (io.Reader, error) {
+func DecryptStream(key []byte, stream io.ReadWriter) (io.ReadWriter, error) {
 	blockCipher, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to create cipher: %w", ErrInitFailed, err)
@@ -143,8 +143,7 @@ func DecryptStream(key []byte, stream io.Reader) (io.Reader, error) {
 	// Confirm that the first 4 bytes is our protocol signature "ON_1"
 	{
 		var header [4]byte
-		_, err := io.ReadFull(stream, header[:])
-		if err != nil {
+		if _, err := io.ReadFull(stream, header[:]); err != nil {
 			if err == io.EOF {
 				err = io.ErrUnexpectedEOF
 			}
@@ -156,9 +155,9 @@ func DecryptStream(key []byte, stream io.Reader) (io.Reader, error) {
 		}
 	}
 
-	// Read the initialization vector to start the chained block cipher.
-	iv := [16]byte{}
-	_, err = io.ReadFull(stream, iv[:])
+	// Read the salt to start the chained block cipher.
+	remoteSalt := [16]byte{}
+	_, err = io.ReadFull(stream, remoteSalt[:])
 	if err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
@@ -166,29 +165,40 @@ func DecryptStream(key []byte, stream io.Reader) (io.Reader, error) {
 		return nil, fmt.Errorf("%w: %w", ErrInitFailed, err)
 	}
 
-	mode := cipher.NewCBCDecrypter(blockCipher, iv[:])
+	encrypter := &encrypter{
+		mode: cipher.NewCBCEncrypter(blockCipher, remoteSalt[:]),
+		out:  stream,
+	}
+
+	// Send the client salt
+	clientSalt := generateSalt(aes.BlockSize)
+	if _, err := stream.Write(clientSalt[:]); err != nil {
+		return nil, fmt.Errorf("%w: failed to write client salt: %w", ErrInitFailed, err)
+	}
 
 	decrypter := &decrypter{
-		mode: mode,
+		mode: cipher.NewCBCDecrypter(blockCipher, clientSalt[:]),
 		in:   stream,
 
 		// The buffer is a working memory space for reading decrypted data.
 		buffer: make([]byte, 2048),
 	}
 
-	// Verify the key hash with our own.
+	// Read the key hash
 	var hash [32]byte
-	io.ReadFull(decrypter, hash[:])
+	io.ReadFull(stream, hash[:])
 
 	// If the key hash doesn't match what we have, then reject the stream. Use a specific
 	// error for this, since this may be a user error that can be corrected.
-	expectedHash := sha256.Sum256(key)
+	expectedHash := sha256.Sum256(append(clientSalt, key...))
 	if slices.Compare(hash[:], expectedHash[:]) != 0 {
+		stream.Write([]byte("FAIL"))
 		return nil, fmt.Errorf("%w: %w", ErrInitFailed, ErrKeyMismatch)
 	}
+	stream.Write([]byte("OKAY"))
 
 	// Strip NUL from the output from this point forward (switching to TEXT mode).
 	decrypter.StripNul = true
 
-	return decrypter, nil
+	return &combinedStream{encrypter, decrypter}, nil
 }

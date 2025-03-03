@@ -22,12 +22,17 @@ const (
 	LogLevelError
 )
 
+// Define your own LoggerFunc and pass it to SetLogger to receive log messages from the
+// system.
 type LoggerFunc = func(level LogLevel, message string)
 
+// Enable logging by calling this function with a log callback. Provide `nil` to disable
+// logging.
 func SetLogger(logger LoggerFunc) {
 	myLogger = logger
 }
 
+// This is a simple logger that writes everything to stdout.
 func StdOutLogger(level LogLevel, message string) {
 	switch level {
 	case LogLevelDebug:
@@ -41,6 +46,8 @@ func StdOutLogger(level LogLevel, message string) {
 	}
 }
 
+// Main logging function. Forwards a log message to the registered log handler. Does
+// nothing if no logger is set up.
 func log(level LogLevel, message string) {
 	if myLogger != nil {
 		logMutex.Lock()
@@ -55,6 +62,10 @@ func logDebug(message string) {
 
 func logInfo(message string) {
 	log(LogLevelInfo, message)
+}
+
+func logWarn(message string) {
+	log(LogLevelWarn, message)
 }
 
 func logError(message string) {

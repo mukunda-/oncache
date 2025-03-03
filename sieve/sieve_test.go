@@ -3,6 +3,16 @@
 // Licensed under MIT. See LICENSE file.
 //////////////////////////////////////////////////////////////////////////////////////////
 
-package oncache
+package sieve_test
 
-// Provides subscriptions to messages.
+import (
+	"testing"
+
+	"go.mukunda.com/oncache/sieve"
+)
+
+func Test1(t *testing.T) {
+	sieve.Now = func() int64 {
+		return 0
+	}
+}

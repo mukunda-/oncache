@@ -26,15 +26,15 @@ type encrypter struct {
 	out  io.Writer
 }
 
-// Generates a random 16-byte IV for CBC encryption.
-func generateIV() []byte {
-	iv := make([]byte, aes.BlockSize) // AES block size is 16 bytes
-	_, err := rand.Read(iv)
+// Generates a random 16-byte salt for encryption.
+func generateSalt(size int) []byte {
+	salt := make([]byte, size)
+	_, err := rand.Read(salt)
 	if err != nil {
 		// Panic if crypto/rand is unavailable from the system.
 		panic("crypto/rand failed")
 	}
-	return iv
+	return salt
 }
 
 // Copy the data and pad it to a multiple of 16 using zero bytes.
@@ -63,43 +63,74 @@ func (e *encrypter) Write(data []byte) (n int, err error) {
 	return written, nil
 }
 
-// Wrap the given io.Writer with encryption. This must be done before any data is sent, as
-// the encryption header must come first.
+type combinedStream struct {
+	out *encrypter
+	in  *decrypter
+}
+
+func (e *combinedStream) Write(data []byte) (n int, err error) {
+	return e.out.Write(data)
+}
+
+func (e *combinedStream) Read(data []byte) (n int, err error) {
+	return e.in.Read(data)
+}
+
+// Wrap the given stream with encryption using the oncrypt protocol. This executes the
+// oncrypt handshake and returns an encrypted writer. Stream read is required to complete
+// the handshake, but not for writing data.
 //
 // The key must be 16, 24, or 32 bytes, resulting in AES-128, AES-192, or AES-256
 // encryption respectively.
 //
 // Errors:
-//   - ErrInitFailed: invalid args (key size), failed to write initial data to stream (may
-//     contain wrapped error.
-func EncryptStream(key []byte, stream io.Writer) (io.Writer, error) {
+//
+//   - ErrInitFailed: invalid args (key size) or failed handshake. May contain wrapped
+//     error.
+func EncryptStream(key []byte, stream io.ReadWriter) (io.ReadWriter, error) {
 	blockCipher, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to create cipher: %w", ErrInitFailed, err)
 	}
 
-	iv := generateIV()
-	mode := cipher.NewCBCEncrypter(blockCipher, iv)
+	remoteSalt := generateSalt(aes.BlockSize)
 
 	// Version
 	if _, err := stream.Write([]byte("ON_1")); err != nil {
-		return nil, fmt.Errorf("%w: failed to write header: %w", ErrInitFailed, err)
+		return nil, fmt.Errorf("%w: failed to write protocol id: %w", ErrInitFailed, err)
 	}
 
-	// Nonce
-	if _, err := stream.Write(iv); err != nil {
+	// Remote Salt
+	if _, err := stream.Write(remoteSalt); err != nil {
 		return nil, fmt.Errorf("%w: failed to write nonce: %w", ErrInitFailed, err)
 	}
 
+	// Read local salt
+	var clientSalt [16]byte
+	if _, err := io.ReadFull(stream, clientSalt[:]); err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, fmt.Errorf("%w: failed to read client salt: %w", ErrInitFailed, err)
+	}
+
 	encrypter := &encrypter{
-		mode: mode,
+		mode: cipher.NewCBCEncrypter(blockCipher, clientSalt[:]),
 		out:  stream,
 	}
 
-	hash := sha256.Sum256(key)
+	decrypter := &decrypter{
+		mode: cipher.NewCBCDecrypter(blockCipher, remoteSalt),
+		in:   stream,
+
+		// The buffer is a working memory space for reading decrypted data.
+		buffer: make([]byte, 2048),
+	}
+
+	hash := sha256.Sum256(append(clientSalt[:], key...))
 	if _, err := encrypter.Write(hash[:]); err != nil {
 		return nil, fmt.Errorf("%w: failed to write key hash: %w", ErrInitFailed, err)
 	}
 
-	return encrypter, nil
+	return &combinedStream{encrypter, decrypter}, nil
 }

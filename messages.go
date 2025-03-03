@@ -10,7 +10,6 @@ import (
 	"io"
 	"net"
 	"strings"
-	"sync"
 	"time"
 
 	"go.mukunda.com/oncache/oncrypt"
@@ -23,126 +22,156 @@ var PeerQueueSize = 100
 
 type peerSendQueue chan string
 
+type networkPeer struct {
+	address string
+	queue   peerSendQueue
+	cancel  signal
+}
+
 var DialerTimeout = 10 * time.Second
-var peerLock sync.Mutex
-var networkPeers = make(map[string]peerSendQueue)
-var outgoingMessageQueue = make(chan string, 1000)
-var incomingMessageQueue = make(chan string, 1000)
 
-func registerPeer(wg *sync.WaitGroup, address string) {
-	peerLock.Lock()
-	defer peerLock.Unlock()
+func (oc *Oncache) registerPeer(address string) {
+	oc.peerLock.Lock()
+	defer oc.peerLock.Unlock()
 
-	if _, ok := networkPeers[address]; ok {
+	if _, ok := oc.networkPeers[address]; ok {
 		return
 	}
 
 	queue := make(chan string, PeerQueueSize)
+	oc.networkPeers[address] = &networkPeer{address, queue, newSignal()}
 
-	networkPeers[address] = queue
-
-	wg.Add(1)
-	go peerDeliveryProcess(wg, address, queue)
+	oc.activeWork.Add(1)
+	go oc.peerDeliveryProcess(address, queue)
 }
 
-func removePeer(address string) {
-	peerLock.Lock()
-	defer peerLock.Unlock()
+func (oc *Oncache) removePeer(address string) {
+	oc.peerLock.Lock()
+	defer oc.peerLock.Unlock()
 
-	if _, ok := networkPeers[address]; ok {
-		delete(networkPeers, address)
+	if peer, ok := oc.networkPeers[address]; ok {
+		peer.cancel.raise()
+		delete(oc.networkPeers, address)
 	}
 }
 
-func DispatchMessage(channel string, message string) {
-	outgoingMessageQueue <- channel + " " + message
+// Send a message to all peers. `channel` is a string that identifies the message type.
+// Channel "1" is used by the Oncache system (invalidations, etc). Channel strings should
+// be lowercase alphanumeric with no spaces.
+//
+// Messages cannot contain line breaks. LF is the stream delimiter.
+func (oc *Oncache) DispatchMessage(channel string, message string) {
+	oc.outgoingMessageQueue <- channel + " " + message
 }
 
-func handleChannel1Message(message string) {
+// Handle a message on channel "1" (system).
+func (oc *Oncache) handleChannel1Message(message string) {
 	fields := strings.Fields(message)
 	if len(fields) < 1 {
-		logError("Invalid message on channel 1")
+		logError("Invalid message on channel 1 (too short).")
 		return
 	}
+
 	cmd, rest, _ := strings.Cut(message, " ")
 	rest = strings.TrimSpace(rest)
 	if cmd == "DEL" {
 		// datastring is a key
-		invalidateLocal(rest)
+		oc.invalidateLocal(rest)
+	} else {
+		logError(fmt.Sprintf("Unknown command on channel 1: %s", message))
 	}
 }
 
-func handleMessageReceived(message string) {
+// Called when a message is received from a peer.
+func (oc *Oncache) handleMessageReceived(fullMessage string) {
 	var channel, rest string
-	channel, rest, _ = strings.Cut(message, " ")
+	channel, rest, _ = strings.Cut(fullMessage, " ")
 	rest = strings.TrimSpace(rest)
 
 	if channel == "1" {
-		handleChannel1Message(rest)
+		oc.handleChannel1Message(rest)
 	}
 
 	// Check if channel has a callback and call that.
 }
 
-func messageSendProcess(wg *sync.WaitGroup) {
-	defer catchProcessPanic("messageSendProcess", wg, func() { messageSendProcess(wg) })
+// Sending work process. This monitors the queue and broadcasts to peer channels.
+func (oc *Oncache) messageSendProcess() {
+	defer oc.onProcessCompleted(
+		"messageSendProcess",
+		func() { oc.messageSendProcess() },
+	)
 
 	for {
 		select {
-		case message := <-outgoingMessageQueue:
-			broadcastMessage(message)
-		case <-shutdownSignal.C:
+		case message := <-oc.outgoingMessageQueue:
+			oc.broadcastMessage(message)
+		case <-oc.shutdownSignal.C:
 			return
 		}
 	}
 }
 
-func broadcastMessage(message string) {
-	peerLock.Lock()
-	defer peerLock.Unlock()
+// Submit a message to all peer queues.
+func (oc *Oncache) broadcastMessage(message string) {
+	oc.peerLock.RLock()
+	defer oc.peerLock.RUnlock()
 
-	for address, peerQueue := range networkPeers {
+	for address, peer := range oc.networkPeers {
 		select {
-		case peerQueue <- message:
+		case peer.queue <- message:
 		default:
-			// Skip if the queue is full
+			// If the queue is full, drop the message. This may happen if a peer becomes
+			// unresponsive. It will either recover or be dropped from the system later.
 			logError(fmt.Sprintf("[%s] Peer queue full, dropping message.", address))
 		}
 	}
 }
 
-func waitForMessagesToSend(sendQueue chan string) (string, bool) {
+// Monitor the outgoing queue for a peer for new messages. When they are submitted, gather
+// all of them and return as a single LF-delimited string.
+func (oc *Oncache) waitForMessagesToSend(sendQueue chan string) (string, bool) {
 	var messageData string
 	select {
 	case messageData = <-sendQueue:
-	case <-shutdownSignal.C:
+		// New message received.
+	case <-oc.shutdownSignal.C:
+		// System is shutting down. Escape.
 		return "", false
 	}
 
 	messageData += "\n"
 
+	// Gather any additional messages in the queue.
 	for {
 		select {
 		case additionalData := <-sendQueue:
 			messageData += additionalData + "\n"
 		default:
+			// No more messages, return.
 			return messageData, true
 		}
 	}
 }
 
-func peerDeliveryProcess(wg *sync.WaitGroup, address string, sendQueue chan string) {
+// Process for connecting to a peer and sending messages. This process is started per
+// peer.
+func (oc *Oncache) peerDeliveryProcess(address string,
+	sendQueue chan string) {
+
 	var conn net.Conn
 	var encrypter io.Writer
 
-	defer catchProcessPanic("peerProcess", wg, func() { peerDeliveryProcess(wg, address, sendQueue) })
-	defer conn.Close()
+	defer oc.onProcessCompleted("peerProcess",
+		func() { oc.peerDeliveryProcess(address, sendQueue) },
+	)
+	defer conn.Close() // Make sure the channel is closed if we exit this function.
 
 	dialer := net.Dialer{Timeout: DialerTimeout}
 	backoff := backoffRetry{period: 1.0, limit: 120.0, rate: 2.0}
 
 restart:
-	messages, ok := waitForMessagesToSend(sendQueue)
+	messages, ok := oc.waitForMessagesToSend(sendQueue)
 	if !ok {
 		return
 	}
@@ -156,16 +185,18 @@ restart:
 		if err != nil {
 
 			if time.Now().UnixMilli()-startTime > DialerTimeout.Milliseconds() {
-				logError(fmt.Sprintf("[%s] Dial timeout; removing peer", address))
-				removePeer(address)
+				logError(fmt.Sprintf("[%s] Dial timeout; removing peer.", address))
+				oc.removePeer(address)
 				return
 			}
 
 			delay := int(backoff.get())
-			logError(fmt.Sprintf("[%s] Error dialing %s; retrying in %d secs", address, err, delay))
+			logError(fmt.Sprintf("[%s] Error dialing %s; retrying in %d secs.", address, err, delay))
 			select {
 			case <-time.After(time.Duration(delay) * time.Second):
-			case <-shutdownSignal.C:
+			case <-oc.shutdownSignal.C:
+				return
+			case <-oc.networkPeers[address].cancel.C:
 				return
 			}
 			continue
@@ -174,9 +205,9 @@ restart:
 		backoff.reset(1.0)
 
 		// Connection established.
-		encrypter, err = oncrypt.EncryptStream(encryptionKey, conn)
+		encrypter, err = oncrypt.EncryptStream(oc.encryptionKey, conn)
 		if err != nil {
-			logError(fmt.Sprintf("[%s] Error starting encrypted stream: %v; dropping messages and restarting", address, err))
+			logError(fmt.Sprintf("[%s] Error starting encrypted stream: %v; dropping messages and restarting.", address, err))
 			conn.Close()
 			conn = nil
 			goto restart
@@ -185,7 +216,7 @@ restart:
 
 	_, err := encrypter.Write([]byte(messages))
 	if err != nil {
-		logError(fmt.Sprintf("[%s] Failed writing messages: %v; restarting", address, err))
+		logError(fmt.Sprintf("[%s] Failed writing messages: %v; restarting.", address, err))
 		conn.Close()
 		conn = nil
 		encrypter = nil

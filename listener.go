@@ -12,37 +12,37 @@ import (
 	"io"
 	"net"
 	"strings"
-	"sync"
 	"time"
 
 	"go.mukunda.com/oncache/oncrypt"
 )
 
-// This process listens for connections and handles creation of goroutines for receiving
-// clients. When connecting, it registers them as peers.
-func listenerProcess(wg *sync.WaitGroup) {
+// This process listens for connections and spawns goroutines for handling clients. When
+// a client connects, it registers them as a peer.
+func (oc *Oncache) listenerProcess() {
 	// If anything causes an unexpected panic, try to restart.
-	defer catchProcessPanic("listenerProcess", wg, func() { listenerProcess(wg) })
+	defer oc.onProcessCompleted("listenerProcess", func() { oc.listenerProcess() })
 
 restart:
-	if shutdownSignal.raised() {
+	select {
+	case <-oc.shutdownSignal.C:
 		return
+	default:
 	}
 
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", networkPort))
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", oc.listenPort))
 	if err != nil {
 		logError(fmt.Sprintf("Failed to start listener: %s; retrying in 60 seconds.", err))
 		time.Sleep(60 * time.Second)
 		goto restart
 	}
 
-	logInfo(fmt.Sprintf("Listening on port %d", networkPort))
+	logInfo(fmt.Sprintf("Listening on port %d", oc.listenPort))
 	listenerExited := make(chan struct{})
 
 	go func() {
 		defer close(listenerExited)
 		for {
-
 			conn, err := listener.Accept()
 			if err != nil {
 				if err != net.ErrClosed {
@@ -53,18 +53,19 @@ restart:
 				return
 			}
 
-			go handleConnection(wg, conn)
+			go oc.handleConnection(conn)
 		}
 	}()
 
 	for {
 		select {
 		case <-listenerExited:
-			logError(fmt.Sprintf("Listener exited unexpectedly; restarting listener."))
+			logError("Listener exited unexpectedly; restarting listener.")
 			goto restart
-		case <-shutdownSignal.C:
+		case <-oc.shutdownSignal.C:
+			// Oncache is shutting down.
 			listener.Close()
-			<-listenerExited
+			<-listenerExited // Wait for above goroutine to exit before releasing resources.
 			return
 		}
 	}
@@ -72,15 +73,15 @@ restart:
 
 // Handle a connection. Decrypt the stream, register the client, and monitor for messages.
 // Complete messages are delivered to the message handler.
-func handleConnection(wg *sync.WaitGroup, conn net.Conn) {
-	wg.Add(1) // removed in panic handler func
+func (oc *Oncache) handleConnection(conn net.Conn) {
+	oc.activeWork.Add(1) // removed in panic handler func
 	fromAddress := conn.RemoteAddr().String()
 	exiting := make(chan struct{})
 
 	// Upon shutdown, close the connection.
 	go func() {
 		select {
-		case <-shutdownSignal.C:
+		case <-oc.shutdownSignal.C:
 			// System is shutting down, close the connection.
 			conn.Close()
 		case <-exiting:
@@ -95,10 +96,10 @@ func handleConnection(wg *sync.WaitGroup, conn net.Conn) {
 		if r != nil {
 			logError(fmt.Sprintf("[%s] Connection handler panicked: %v", fromAddress, r))
 		}
-		wg.Done()
+		oc.activeWork.Done()
 	}()
 
-	decrypter, err := oncrypt.DecryptStream(encryptionKey, conn)
+	decrypter, err := oncrypt.DecryptStream(oc.encryptionKey, conn)
 	if err != nil {
 		logError(fmt.Sprintf("Failed to decrypt stream: %s", err))
 		return
@@ -131,7 +132,7 @@ func handleConnection(wg *sync.WaitGroup, conn net.Conn) {
 	for scanner.Scan() {
 		message := scanner.Text()
 		logDebug(fmt.Sprintf("[%s]: %s", fromAddress, message))
-		handleMessageReceived(message)
+		oc.handleMessageReceived(message)
 	}
 
 	if !errors.Is(scanner.Err(), io.EOF) {
