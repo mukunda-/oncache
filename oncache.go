@@ -137,6 +137,10 @@ func (oc *Oncache) Invalidate(key string) {
 // This must be called during initialization. This sets the encryption key used between
 // nodes. All nodes must use the same key to communicate. The key should be 16, 24, or 32
 // crypto-random bytes.
+//
+// Errors:
+// - ErrAlreadyInitialized: If the system is already initialized.
+// - ErrInvalidKey: If the key length is invalid.
 func (oc *Oncache) Init(key []byte) error {
 	if oc.live {
 		return ErrAlreadyInitialized

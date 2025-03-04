@@ -2,7 +2,7 @@
 
 Oncache provides a key-value cache with to a peer-to-peer broadcast system to deliver
 invalidation messages. Its primary purpose is an *easy-to-deploy* cache layer for a
-multi-node deployment, where the cache application is attached to every node. Invalidation
+multi-node deployment, where the cache application is attached to every node. Message
 delivery is O(n), so it is not intended for large scale. The use case aims for clusters
 with less than 50 nodes, common in multi-tenant architecture or on-premises deployments.
 
@@ -22,3 +22,5 @@ maintains the list of nodes to connect to, e.g., from a K8s query or configurati
 ```sh
 go get go.mukunda.com/oncache
 ```
+
+TODO: usage, examples, docs, etc.

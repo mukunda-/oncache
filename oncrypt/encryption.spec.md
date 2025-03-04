@@ -18,13 +18,15 @@ SEND [16 bytes] Remote salt (decided by client). Salt for remote->client communi
 RECV [16 bytes] Client salt (decided by remote). Salt for client->remote communication.
                 This initializes the cipher on the client side.
 SEND [8 bytes] Key selector. This is the name of the key to use, similar to the public
-               part of a keypair.
+               part of a keypair. Pad the key name with NUL bytes to 8 bytes.
 RECV [4 bytes] Status. "OKAY", or "FAIL" if the key is not recognized.
+
 (Data is encrypted beyond this point)
+
 RECV [16 bytes] Cipher test (random bytes). This test is mirrored back to the remote to
-                verify that you have the key. Otherwise an attacker could send random data
-                and hope it aligns with a message that causes an error.
+                verify that you have the key and are using the same cipher algorithm.
 SEND [16 bytes] Cipher test (mirrored random bytes).
+
 (Stream encryption is established)
 ```
 

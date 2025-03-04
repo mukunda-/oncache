@@ -10,13 +10,14 @@ import (
 	"sync"
 	"time"
 
-	"go.mukunda.com/oncache/internal/mapchain"
+	"go.mukunda.com/oncache/sieve"
 )
 
 const NeverExpires = time.Duration(-1)
 const NeverCleans = time.Duration(-1)
 const DefaultExpiration = 5 * time.Minute
 const DefaultCleanupPeriod = 10 * time.Minute
+const DefaultMaxKeys = 1000
 
 type Cache interface {
 	// Get a value from the cache. Returns nil if there is no value set or if the value has
@@ -52,7 +53,7 @@ type Cache interface {
 type dcache struct {
 	parent            *Oncache
 	name              string
-	data              *mapchain.Mapchain
+	data              *sieve.Sieve
 	maxKeys           int
 	defaultExpiration int32 // seconds
 	cleanupPeriod     int32 // seconds
@@ -64,56 +65,48 @@ type dcache struct {
 	epoch int64
 }
 
-type cacheValue struct {
-	value      any
-	expiration int32
-}
-
 // No logging is done in Get/Set for performance reasons.
 
 func (c *dcache) Get(key string) any {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
-	value := c.data.Get(key)
-	if value == nil {
-		return nil
-	}
-
-	if time.Now().Unix() > c.epoch+int64(value.(cacheValue).expiration) {
-		return nil
-	}
-
-	return value
+	return c.data.Get(key)
 }
 
+// Set a key with a specific expiration time. 0 or NeverExpires for no expiration.
 func (c *dcache) SetEx(key string, value any, expiration time.Duration) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
 	if value == nil {
-		c.data.Set(key, nil)
+		c.data.Delete(key)
 		return
-	} else {
-		c.data.Set(key, cacheValue{
-			value:      value,
-			expiration: int32(expiration.Seconds()),
-		})
 	}
+
+	if expiration < 0 {
+		expiration = 0
+	}
+	c.data.Set(key, value, expiration)
 }
 
+// Set a key with the default expiration time.
 func (c *dcache) Set(key string, value any) {
 	c.SetEx(key, value, time.Duration(c.defaultExpiration)*time.Second)
 }
 
+// Delete (invalidate) a key from the cache.
 func (c *dcache) Delete(key string) {
 	c.Set(key, nil)
 }
 
+// Checks if the cleanup is due and then executes Clean.
 func (c *dcache) checkAndRunClean() bool {
 	if c.cleanupPeriod == 0 {
+		// Auto cleanup is disabled.
 		return false
 	}
+
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 	if time.Now().Unix() < c.nextCleanup {
@@ -121,7 +114,7 @@ func (c *dcache) checkAndRunClean() bool {
 	}
 
 	c.nextCleanup = Unixtime(time.Now().Unix()) + int64(c.cleanupPeriod)
-	c.Clean()
+	c.data.Clean()
 	return true
 }
 
@@ -129,50 +122,54 @@ func (c *dcache) Clean() {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	now := time.Now().Unix()
+	c.data.Clean()
 
-	filter := mapchain.NewFilterJob(c.data, func(value any) bool {
-		if value == nil {
-			return true
-		}
+	/*
+		now := time.Now().Unix()
 
-		exp := value.(cacheValue).expiration
-		if exp == 0 {
-			return false
-		}
-
-		return now > c.epoch+int64(exp)
-	})
-
-	go func() {
-
-		for {
-			_, _, done := filter.Run()
-			if done {
-				return
+		filter := mapchain.NewFilterJob(c.data, func(value any) bool {
+			if value == nil {
+				return true
 			}
-			select {
-			case <-time.After(100 * time.Millisecond):
-				// continue
-			case <-c.parent.shutdownSignal.C:
-				return
+
+			exp := value.(cacheValue).expiration
+			if exp == 0 {
+				return false
 			}
-		}
-	}()
+
+			return now > c.epoch+int64(exp)
+		})
+
+		go func() {
+
+			for {
+				_, _, done := filter.Run()
+				if done {
+					return
+				}
+				select {
+				case <-time.After(100 * time.Millisecond):
+					// continue
+				case <-c.parent.shutdownSignal.C:
+					return
+				}
+			}
+		}()
+	*/
 }
 
 // Options for NewCache. All options can be `nil` which indicates the default value.
 type NewCacheOptions struct {
-	// The max amount of keys the cache can hold. -1 = no limit, 0 = default (no limit)
+	// The max amount of keys the cache can hold. Must be 1-65535. Default is 1000.
 	MaxKeys int
 
 	// The default period before values are considered stale.
-	// -1 = never expire. 0 = default (5 mins)
+	// -1 = never expire. 0 = use default (5 mins)
 	DefaultExpiration time.Duration
 
-	// The period between garbage collection. -1 = no cleanup (expired keys will never be
-	// freed). No cleanup is useful if you have a set amount of possible keys.
-	// [Cache.Clean] can also be called manually on cache instances. 0 = default (10mins)
+	// The period between garbage collection. -1 = no cleanup, where expired keys will only
+	// be deleted when they are naturally evicted. [Cache.Clean] can also be called
+	// manually on cache instances. 0 = use default (10mins)
 	CleanupPeriod time.Duration
 }
 
@@ -191,8 +188,7 @@ func (oc *Oncache) NewCache(name string, options ...NewCacheOptions) Cache {
 
 	cache = &dcache{
 		name:              name,
-		data:              mapchain.NewMapChain(),
-		maxKeys:           0,
+		maxKeys:           DefaultMaxKeys,
 		defaultExpiration: int32(DefaultExpiration.Seconds()),
 		cleanupPeriod:     int32(DefaultCleanupPeriod.Seconds()),
 	}
@@ -200,9 +196,6 @@ func (oc *Oncache) NewCache(name string, options ...NewCacheOptions) Cache {
 	for _, opt := range options {
 		if opt.MaxKeys != 0 {
 			cache.maxKeys = opt.MaxKeys
-			if cache.maxKeys < 0 {
-				cache.maxKeys = 0
-			}
 		}
 		if opt.DefaultExpiration != 0 {
 			cache.defaultExpiration = int32(opt.DefaultExpiration.Seconds())
@@ -226,6 +219,7 @@ func (oc *Oncache) NewCache(name string, options ...NewCacheOptions) Cache {
 			cache.cleanupPeriod+cache.cleanupPeriod,
 		))
 
+	cache.data = sieve.NewSieve(uint16(cache.maxKeys))
 	cache.nextCleanup = Unixtime(time.Now().Unix()) + int64(cache.cleanupPeriod)
 	oc.registerCache(name, cache)
 	return cache

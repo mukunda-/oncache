@@ -26,8 +26,8 @@ const (
 // system.
 type LoggerFunc = func(level LogLevel, message string)
 
-// Enable logging by calling this function with a log callback. Provide `nil` to disable
-// logging.
+// This function enables logging. Provide a callback to receive log messages. Provide
+// `nil` to disable logging.
 func SetLogger(logger LoggerFunc) {
 	myLogger = logger
 }

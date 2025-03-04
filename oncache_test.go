@@ -6,15 +6,6 @@ import (
 	"go.mukunda.com/oncache"
 )
 
-type Config string
-
-func (s string) AsConfig() Config {
-	return Config{}
-}
-
-func test1(cfg Config) {
-}
-
 func TestOncacheSingleNode(t *testing.T) {
 	oc := oncache.New()
 	oc.SetPort(8850)
@@ -24,8 +15,12 @@ func TestOncacheSingleNode(t *testing.T) {
 
 	oc.Init(make([]byte, 16))
 
-	cache.Set("key1/key2", "value")
-	cache.Set("key1/key3", "value")
-	cache.Set("key1/key4", "value")
+	cache.Set("key1", "key1")
+	cache.Set("key2", "key2")
+	cache.Set("key3", "key3")
+
+	if cache.Get("key1") != nil {
+		t.Error("key1 should have been evicted")
+	}
 
 }

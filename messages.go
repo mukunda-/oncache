@@ -165,7 +165,11 @@ func (oc *Oncache) peerDeliveryProcess(address string,
 	defer oc.onProcessCompleted("peerProcess",
 		func() { oc.peerDeliveryProcess(address, sendQueue) },
 	)
-	defer conn.Close() // Make sure the channel is closed if we exit this function.
+	defer func() {
+		if conn != nil {
+			conn.Close() // Make sure the channel is closed if we exit this function.
+		}
+	}()
 
 	dialer := net.Dialer{Timeout: DialerTimeout}
 	backoff := backoffRetry{period: 1.0, limit: 120.0, rate: 2.0}
