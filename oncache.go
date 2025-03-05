@@ -10,6 +10,7 @@ package oncache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime/debug"
 	"strings"
@@ -19,6 +20,14 @@ import (
 
 type Unixtime = int64
 type Context context.Context
+type Hoststring = string
+
+type MessageSubscriberId = int
+type MessageHandler func(host Hoststring, channel string, message string)
+type MessageSubscriber struct {
+	id      MessageSubscriberId
+	handler MessageHandler
+}
 
 type signal struct {
 	C      chan struct{}
@@ -50,23 +59,51 @@ func newSignal() signal {
 
 // An Oncache instance. Normally you only have one of these.
 type Oncache struct {
+	// The network port to listen to. Default 7750.
 	listenPort int
+
+	// Total work in progress. All processes increment this while they are working. The
+	// shutdown process will wait for this to finish before returning.
 	activeWork *sync.WaitGroup
 
-	caches         map[string]Cache
-	cachesLock     sync.RWMutex
+	// Caches can only be added, not removed. Important for thread safety.
+	caches     map[string]Cache
+	cachesLock sync.RWMutex // For accessing or updating the caches map.
+
+	// This is closed when the system is shutting down. All processes should check this
+	// during sleep periods.
 	shutdownSignal signal
 
-	// Set during init.
+	// Set during init
+	// ---------------
+
+	// AES encryption key to use. Must be 16, 24, or 32 bytes.
 	encryptionKey []byte
-	live          bool
+
+	// Currently always "default". The encryption key name can be used to select different
+	// keys from a set. We don't support multiple keys currently, but the encryption
+	// protocol does.
+	encryptionKeyName string
+
+	// If the system is started (not sure if useful?).
+	live bool
 
 	// Networking
+	// ----------
+
+	// The local hostname.
+	hostname string
 
 	peerLock             sync.RWMutex
-	networkPeers         map[string]*networkPeer
-	outgoingMessageQueue chan string
-	incomingMessageQueue chan string
+	networkPeers         map[Hoststring]*networkPeer
+	outgoingMessageQueue chan string // Broadcast to all peers.
+	incomingMessageQueue chan string // Received from any peer.
+
+	subscriptionLock sync.Mutex
+
+	// Grouped by channels. Empty entry "" matches all channels.
+	subscriptions      map[string][]MessageSubscriber
+	nextSubscriptionId int
 }
 
 // Default port that Oncache listens on.
@@ -103,45 +140,73 @@ func New() *Oncache {
 //
 // Initial discovery of other peers is beyond the scope of this package.
 func (oc *Oncache) Connect(hosts []string) {
+	myHostWithoutPort, _, _ := strings.Cut(oc.hostname, ":")
+
 	for _, host := range hosts {
+		if host == oc.hostWithPort() {
+			continue
+		}
+		hostWithoutPort, _, _ := strings.Cut(host, ":")
+		if hostWithoutPort == myHostWithoutPort {
+			logWarn("Remote hostname matches own (" + host + ").")
+		}
+
 		oc.registerPeer(host)
 	}
 }
 
 // Invalidate a key prefix from the local caches (without propagation).
-func (oc *Oncache) invalidateLocal(key string) {
-	cacheName, key, found := strings.Cut(key, "/")
-	if !found {
-		// Invalid key.
-		return
-	}
+func (oc *Oncache) deleteLocal(fullkey string) {
+	cacheName, key, found := strings.Cut(fullkey, "/")
 
 	cache := oc.GetCache(cacheName)
 	if cache == nil {
 		// Cache not found.
-		logWarn("Tried to invalidate key in cache that doesn't exist: " + cacheName)
+		logWarn("Tried to delete key in cache that doesn't exist: " + cacheName)
 		return
 	}
 
-	cache.Delete(key)
+	if found {
+		cache.DeleteLocal(key)
+	} else {
+		cache.ResetLocal()
+	}
 }
 
-// Invalidate a key prefix. Do not include a trailing slash. This will evict all keys with
-// the given prefix from the caches and then propagate an invalidation message to all
-// peers.
-func (oc *Oncache) Invalidate(key string) {
-	oc.invalidateLocal(key)
+// Delete a cache entry. The key format is <cachename>/<cachekey>. If you only include the
+// cachename with no trailing slash, then the entire cache under that name will be reset.
+func (oc *Oncache) Delete(key string) {
+	oc.deleteLocal(key)
 	oc.DispatchMessage("1", "DEL "+key)
+}
+
+// Returned when the key is not the expected format.
+var ErrInvalidKey = errors.New("invalid key; must be 16, 24, or 32 bytes")
+
+// If you call Init twice.
+var ErrAlreadyInitialized = errors.New("already initialized")
+
+func (oc *Oncache) hostWithPort() string {
+	if strings.Contains(oc.hostname, ":") {
+		return oc.hostname
+	} else {
+		return oc.hostname + ":" + fmt.Sprint(oc.listenPort)
+	}
 }
 
 // This must be called during initialization. This sets the encryption key used between
 // nodes. All nodes must use the same key to communicate. The key should be 16, 24, or 32
 // crypto-random bytes.
 //
+// The hostname is where other nodes will connect to. It should be a hostname that is
+// accessible from other nodes. If the public port differs from the local listen port, you
+// can specify it with a `:port` suffix. Otherwise, the local listen port is attached to
+// the hostname.
+//
 // Errors:
 // - ErrAlreadyInitialized: If the system is already initialized.
 // - ErrInvalidKey: If the key length is invalid.
-func (oc *Oncache) Init(key []byte) error {
+func (oc *Oncache) Init(key []byte, hostname string) error {
 	if oc.live {
 		return ErrAlreadyInitialized
 	}
@@ -153,6 +218,8 @@ func (oc *Oncache) Init(key []byte) error {
 	logInfo("Oncache initializing.")
 	logInfo(fmt.Sprintf("keysize = %d", len(key)))
 	oc.encryptionKey = key
+	oc.encryptionKeyName = "default"
+	oc.hostname = hostname
 	oc.live = true
 	oc.shutdownSignal = newSignal()
 
@@ -249,13 +316,14 @@ func (oc *Oncache) registerCache(name string, cache Cache) {
 }
 
 // Get a cache by name. Returns nil if the cache does not exist. Create caches with
-// NewCache.
+// [Oncache.NewCache].
 func (oc *Oncache) GetCache(name string) Cache {
 	oc.cachesLock.RLock()
 	defer oc.cachesLock.RUnlock()
 	return oc.caches[name]
 }
 
+// Returns a copy of the caches map, so it can be iterated over safely.
 func (oc *Oncache) GetAllCaches() map[string]Cache {
 	oc.cachesLock.RLock()
 	defer oc.cachesLock.RUnlock()

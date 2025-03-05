@@ -30,8 +30,63 @@ func TestFailedCryptoRand(t *testing.T) {
 	}()
 
 	rand.Reader = &io.LimitedReader{R: rand.Reader, N: 0}
-	oncrypt.EncryptStream(make([]byte, 32), io.Discard)
+	oncrypt.EncryptStream(make([]byte, 32), nil)
+}
 
+func mockRemote(key []byte) io.ReadWriter {
+	readerIn, writerIn := io.Pipe()
+	readerOut, writerOut := io.Pipe()
+
+	go func() {
+		decrypter, err := oncrypt.DecryptStream(key, struct {
+			io.Reader
+			io.Writer
+		}{readerIn, writerOut})
+		if err != nil {
+			panic(err)
+		}
+
+		_, _ = io.Copy(decrypter, readerIn)
+	}()
+
+	return struct {
+		io.Reader
+		io.Writer
+	}{readerOut, writerIn}
+}
+
+// Limit the amount of received bytes to limit before unexpectedly closing the stream.
+func mockRemoteLimitedReaders(key []byte, inLimit int64, outLimit int64) io.ReadWriter {
+
+	readerIn, writerIn := io.Pipe()
+	readerOut, writerOut := io.Pipe()
+
+	go func() {
+		var in io.Reader = readerIn
+		if inLimit > 0 {
+			in = io.LimitReader(readerIn, inLimit)
+		}
+		decrypter, err := oncrypt.DecryptStream(key, struct {
+			io.Reader
+			io.Writer
+		}{in, writerOut})
+		if err != nil {
+			readerIn.Close()
+			return
+		}
+
+		_, _ = io.Copy(decrypter, readerIn)
+	}()
+
+	var out io.Reader = readerOut
+	if outLimit > 0 {
+		out = io.LimitReader(readerOut, outLimit)
+	}
+
+	return struct {
+		io.Reader
+		io.Writer
+	}{out, writerIn}
 }
 
 // Most encryption behavior is covered by decrypt tests.
@@ -41,7 +96,7 @@ func TestBadEncryptionKey(t *testing.T) {
 
 	for i := 0; i < 33; i++ {
 		key := make([]byte, i)
-		_, err := oncrypt.EncryptStream(key, io.Discard)
+		_, err := oncrypt.EncryptStream(key, mockRemote(make([]byte, i)))
 		if i == 16 || i == 24 || i == 32 {
 			if err != nil {
 				t.Error("Unexpected error:", err)
@@ -61,69 +116,43 @@ func assertContains(t *testing.T, text string, contains string) {
 	}
 }
 
-func TestFailWritingHeaders(t *testing.T) {
+func TestFailWritingHandshake(t *testing.T) {
 	// [SPEC] Creating an encryption stream should gracefully fail if the stream cannot
 	//        accept the required headers.
 
-	// Failed header
-	{
-		reader, writer := io.Pipe()
-		go func() {
-			io.ReadFull(reader, make([]byte, 2))
-			reader.Close()
-		}()
+	testForError := func(t *testing.T, writeLimit int64, readLimit int64, contains string, errclass error) {
+		t.Helper()
 
-		_, err := oncrypt.EncryptStream(make([]byte, 32), writer)
-		if !errors.Is(err, oncrypt.ErrInitFailed) || !errors.Is(err, io.ErrClosedPipe) {
-			// should be init failed + closed pipe
-			t.Error("Unexpected error format:", err)
-		}
-		assertContains(t, err.Error(), "header")
-	}
+		_, err := oncrypt.EncryptStream(make([]byte, 32),
+			mockRemoteLimitedReaders(make([]byte, 32), writeLimit, readLimit))
 
-	// Failed nonce
-	{
-		reader, writer := io.Pipe()
-		go func() {
-			io.ReadFull(reader, make([]byte, 6))
-			reader.Close()
-		}()
+		if errclass != nil {
+			if !errors.Is(err, oncrypt.ErrInitFailed) || !errors.Is(err, errclass) {
+				t.Error("Unexpected error format:", err)
+			}
 
-		_, err := oncrypt.EncryptStream(make([]byte, 32), writer)
-		if !errors.Is(err, oncrypt.ErrInitFailed) || !errors.Is(err, io.ErrClosedPipe) {
-			// should be init failed + closed pipe
-			t.Error("Unexpected error format:", err)
-		}
-		assertContains(t, err.Error(), "nonce")
-	}
-
-	// Failed key hash
-	{
-		reader, writer := io.Pipe()
-		go func() {
-			io.ReadFull(reader, make([]byte, 4+16+31))
-			reader.Close()
-		}()
-
-		_, err := oncrypt.EncryptStream(make([]byte, 32), writer)
-		if !errors.Is(err, oncrypt.ErrInitFailed) || !errors.Is(err, io.ErrClosedPipe) {
-			// should be init failed + closed pipe
-			t.Error("Unexpected error format:", err)
-		}
-		assertContains(t, err.Error(), "key hash")
-	}
-
-	// No error with 4+16+32 bytes read.
-	{
-		reader, writer := io.Pipe()
-		go func() {
-			io.ReadFull(reader, make([]byte, 4+16+32))
-			reader.Close()
-		}()
-
-		_, err := oncrypt.EncryptStream(make([]byte, 32), writer)
-		if err != nil {
-			t.Error("Unexpected error:", err)
+			assertContains(t, err.Error(), contains)
+		} else {
+			if err != nil {
+				t.Error("Unexpected error:", err)
+			}
 		}
 	}
+
+	// protocol id (4 bytes)
+	testForError(t, 0+3, 0, "protocol id", io.ErrClosedPipe)
+	// remote salt (16 bytes)
+	testForError(t, 4+15, 0, "remote salt", io.ErrClosedPipe)
+	// Read local salt (16 bytes)
+	testForError(t, 20, 0+15, "client salt", io.ErrUnexpectedEOF)
+	// key name (8 bytes)
+	testForError(t, 20+7, 16, "key name", io.ErrClosedPipe)
+	// read status (4 bytes)
+	testForError(t, 28, 16+3, "status", io.ErrUnexpectedEOF)
+	// read cipher test (16 bytes)
+	testForError(t, 28, 20+15, "cipher test", io.ErrUnexpectedEOF)
+	// write cipher test (16 bytes)
+	testForError(t, 28+15, 36, "cipher test", io.ErrClosedPipe)
+	// full handshake
+	testForError(t, 44, 36, "", nil)
 }

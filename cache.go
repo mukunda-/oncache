@@ -19,6 +19,8 @@ const DefaultExpiration = 5 * time.Minute
 const DefaultCleanupPeriod = 10 * time.Minute
 const DefaultMaxKeys = 1000
 
+var ManagerLock *sync.Mutex = nil
+
 type Cache interface {
 	// Get a value from the cache. Returns nil if there is no value set or if the value has
 	// gone stale. Separate sub-cache paths with slashes, e.g., "aaa/bbb/ccc"
@@ -36,6 +38,9 @@ type Cache interface {
 	//   - aaa/bbb/key2
 	//
 	// and you Delete("aaa"), both keys will be deleted.
+	DeleteLocal(key string)
+
+	// DeleteLocal and propagate to other nodes. Equivalent to oncache.Delete("name/key").
 	Delete(key string)
 
 	// Set a value in the cache with a custom expiration time. Normally, a default
@@ -48,6 +53,12 @@ type Cache interface {
 	// Delete any expired keys. This is called automatically if the cache is configured
 	// with a cleanupPeriod.
 	Clean()
+
+	// Discard all keys.
+	Reset()
+
+	// Discard all keys in this local cache only (do not propagate to other nodes).
+	ResetLocal()
 }
 
 type dcache struct {
@@ -95,9 +106,28 @@ func (c *dcache) Set(key string, value any) {
 	c.SetEx(key, value, time.Duration(c.defaultExpiration)*time.Second)
 }
 
+// Delete (invalidate) a key from the local cache only (usually not desired).
+func (c *dcache) DeleteLocal(key string) {
+	c.Set(key, nil)
+}
+
 // Delete (invalidate) a key from the cache.
 func (c *dcache) Delete(key string) {
-	c.Set(key, nil)
+	c.parent.Delete(c.name + "/" + key)
+}
+
+// Discard all keys from the local cache only (usually not desired).
+func (c *dcache) ResetLocal() {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	c.data.Reset()
+}
+
+// Discard all keys.
+func (c *dcache) Reset() {
+	c.ResetLocal()
+	c.parent.Delete(c.name)
 }
 
 // Checks if the cleanup is due and then executes Clean.
@@ -161,6 +191,8 @@ func (c *dcache) Clean() {
 // Options for NewCache. All options can be `nil` which indicates the default value.
 type NewCacheOptions struct {
 	// The max amount of keys the cache can hold. Must be 1-65535. Default is 1000.
+	// Currently there is no option to have "unlimited" keys, but an additional
+	// implementation may support that in the future.
 	MaxKeys int
 
 	// The default period before values are considered stale.
@@ -180,13 +212,14 @@ type NewCacheOptions struct {
 //
 // If the cache already exists, the existing cache is returned and an error is logged.
 func (oc *Oncache) NewCache(name string, options ...NewCacheOptions) Cache {
-	cache := oc.GetCache(name).(*dcache)
-	if cache != nil {
+	existing := oc.GetCache(name)
+	if existing != nil {
 		logError("Tried to create cache \"" + name + "\" which already exists; using existing cache.")
-		return cache
+		return existing
 	}
 
-	cache = &dcache{
+	cache := &dcache{
+		parent:            oc,
 		name:              name,
 		maxKeys:           DefaultMaxKeys,
 		defaultExpiration: int32(DefaultExpiration.Seconds()),

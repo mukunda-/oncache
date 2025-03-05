@@ -8,15 +8,17 @@ package oncrypt
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 )
 
 var ErrInitFailed = errors.New("initialization failed")
 var ErrKeyMismatch = errors.New("key mismatch")
+
+type KeyRing map[string][]byte
 
 type decrypter struct {
 	mode       cipher.BlockMode
@@ -128,17 +130,32 @@ retry:
 // Wrap the given io.Reader with decryption. This must be done before any data is read,
 // otherwise the encryption header will be corrupted.
 //
-// The key must be 16, 24, or 32 bytes, resulting in AES-128, AES-192, or AES-256
-// decryption respectively.
+// The key can either be a single key as a []byte value or a KeyRing containing named
+// keys. The single key format will be named "default". Key values must be 16, 24, or 32
+// bytes, resulting in AES-128, AES-192, or AES-256 decryption respectively.
 //
 // Errors:
-// - ErrInitFailed: invalid args or invalid stream data
-// - ErrKeyMismatch: stream was not encrypted with the same key
-func DecryptStream(key []byte, stream io.ReadWriter) (io.ReadWriter, error) {
-	blockCipher, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, fmt.Errorf("%w: failed to create cipher: %w", ErrInitFailed, err)
+//   - ErrInitFailed: invalid args or invalid stream data
+//   - ErrMissingKey: the key ring does not contain the key requested by the client
+//   - ErrKeyMismatch: the cipher test fails, indicating that the client has a different
+//     key despite the same name.
+func DecryptStream[T []byte | KeyRing](key T, stream io.ReadWriter) (io.ReadWriter, error) {
+	// This is just a wrapper for type constraints.
+	return decryptStream(key, stream)
+}
+
+func decryptStream(key any, stream io.ReadWriter) (io.ReadWriter, error) {
+	switch keyval := key.(type) {
+	case []byte:
+		key = KeyRing{"default": keyval}
+	case KeyRing:
+	default:
+		return nil, fmt.Errorf("%w: invalid key", ErrInitFailed)
 	}
+
+	keys := key.(KeyRing)
+
+	// As the "decrypter" we are the "remote" side of the handshake.
 
 	// Confirm that the first 4 bytes is our protocol signature "ON_1"
 	{
@@ -155,25 +172,56 @@ func DecryptStream(key []byte, stream io.ReadWriter) (io.ReadWriter, error) {
 		}
 	}
 
-	// Read the salt to start the chained block cipher.
+	// Read the salt from the client. This is the IV for encryption.
 	remoteSalt := [16]byte{}
-	_, err = io.ReadFull(stream, remoteSalt[:])
-	if err != nil {
+	{
+		_, err := io.ReadFull(stream, remoteSalt[:])
+		if err != nil {
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, fmt.Errorf("%w: %w", ErrInitFailed, err)
+		}
+	}
+
+	// Generate salt for the client to use for their encryption.
+	clientSalt := generateSalt(aes.BlockSize)
+	{
+		if _, err := stream.Write(clientSalt[:]); err != nil {
+			return nil, fmt.Errorf("%w: failed to write client salt: %w", ErrInitFailed, err)
+		}
+	}
+
+	// Read the key name; this selects the key to use in the keyring.
+	var keyNameBytes [8]byte
+	if _, err := io.ReadFull(stream, keyNameBytes[:]); err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}
-		return nil, fmt.Errorf("%w: %w", ErrInitFailed, err)
+		return nil, fmt.Errorf("%w: failed to read key name: %w", ErrInitFailed, err)
+	}
+	keyName := string(keyNameBytes[:])
+	keyName = strings.TrimRight(keyName, "\x00")
+
+	cipherkey, ok := keys[keyName]
+	if !ok {
+		// Key not found in keyring.
+		stream.Write([]byte("FAIL"))
+		return nil, fmt.Errorf("%w: client requested key \"%s\" which is not in the keyring", ErrMissingKey, keyName)
+	}
+
+	if _, err := stream.Write([]byte("OKAY")); err != nil {
+		return nil, fmt.Errorf("%w: failed to write status: %w", ErrInitFailed, err)
+	}
+
+	blockCipher, err := aes.NewCipher(cipherkey)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to create cipher: %w", ErrInitFailed, err)
 	}
 
 	encrypter := &encrypter{
 		mode: cipher.NewCBCEncrypter(blockCipher, remoteSalt[:]),
 		out:  stream,
-	}
-
-	// Send the client salt
-	clientSalt := generateSalt(aes.BlockSize)
-	if _, err := stream.Write(clientSalt[:]); err != nil {
-		return nil, fmt.Errorf("%w: failed to write client salt: %w", ErrInitFailed, err)
 	}
 
 	decrypter := &decrypter{
@@ -184,18 +232,25 @@ func DecryptStream(key []byte, stream io.ReadWriter) (io.ReadWriter, error) {
 		buffer: make([]byte, 2048),
 	}
 
-	// Read the key hash
-	var hash [32]byte
-	io.ReadFull(stream, hash[:])
+	cipherTest := generateSalt(16)
 
-	// If the key hash doesn't match what we have, then reject the stream. Use a specific
-	// error for this, since this may be a user error that can be corrected.
-	expectedHash := sha256.Sum256(append(clientSalt, key...))
-	if slices.Compare(hash[:], expectedHash[:]) != 0 {
-		stream.Write([]byte("FAIL"))
-		return nil, fmt.Errorf("%w: %w", ErrInitFailed, ErrKeyMismatch)
+	if _, err := encrypter.Write(cipherTest); err != nil {
+		return nil, fmt.Errorf("%w: failed to write cipher test: %w", ErrInitFailed, err)
 	}
-	stream.Write([]byte("OKAY"))
+
+	{
+		cipherTestRecv := make([]byte, 16)
+		if _, err := io.ReadFull(decrypter, cipherTestRecv); err != nil {
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, fmt.Errorf("%w: failed to read cipher test: %w", ErrInitFailed, err)
+		}
+
+		if slices.Compare(cipherTest, cipherTestRecv) != 0 {
+			return nil, fmt.Errorf("%w: cipher test failed; remote may have a different key", ErrKeyMismatch)
+		}
+	}
 
 	// Strip NUL from the output from this point forward (switching to TEXT mode).
 	decrypter.StripNul = true

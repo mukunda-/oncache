@@ -76,7 +76,11 @@ func (oc *Oncache) handleChannel1Message(message string) {
 	rest = strings.TrimSpace(rest)
 	if cmd == "DEL" {
 		// datastring is a key
-		oc.invalidateLocal(rest)
+		if ManagerLock != nil {
+			ManagerLock.Lock()
+			defer ManagerLock.Unlock()
+		}
+		oc.deleteLocal(rest)
 	} else {
 		logError(fmt.Sprintf("Unknown command on channel 1: %s", message))
 	}
@@ -211,9 +215,18 @@ restart:
 		// Connection established.
 		encrypter, err = oncrypt.EncryptStream(oc.encryptionKey, conn)
 		if err != nil {
-			logError(fmt.Sprintf("[%s] Error starting encrypted stream: %v; dropping messages and restarting.", address, err))
+			logError(fmt.Sprintf("[%s] Error starting encrypted stream: %v; dropping messages and restarting", address, err))
 			conn.Close()
 			conn = nil
+			goto restart
+		}
+
+		_, err = encrypter.Write([]byte("v1 " + oc.hostWithPort() + "\n"))
+		if err != nil {
+			logError(fmt.Sprintf("[%s] Failed writing connection hello: %v; restarting", address, err))
+			conn.Close()
+			conn = nil
+			encrypter = nil
 			goto restart
 		}
 	}
@@ -226,4 +239,23 @@ restart:
 		encrypter = nil
 	}
 	goto restart
+}
+
+func (oc *Oncache) Subscribe(channel string, handler MessageHandler) MessageSubscriberId {
+	oc.subscriptionLock.Lock()
+	defer oc.subscriptionLock.Unlock()
+
+	if _, ok := oc.subscriptions[channel]; !ok {
+		oc.subscriptions[channel] = make([]MessageSubscriber, 0)
+	}
+
+	id := oc.nextSubscriptionId
+	oc.nextSubscriptionId++
+
+	oc.subscriptions[channel] = append(oc.subscriptions[channel], MessageSubscriber{
+		id:      id,
+		handler: handler,
+	})
+
+	return id
 }

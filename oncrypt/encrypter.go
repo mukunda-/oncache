@@ -12,7 +12,6 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -20,6 +19,7 @@ import (
 )
 
 var ErrWriteFailed = errors.New("write failed")
+var ErrMissingKey = errors.New("missing key")
 
 type encrypter struct {
 	mode cipher.BlockMode
@@ -76,18 +76,51 @@ func (e *combinedStream) Read(data []byte) (n int, err error) {
 	return e.in.Read(data)
 }
 
+type NamedKey struct {
+	Name string
+	Key  []byte
+}
+
 // Wrap the given stream with encryption using the oncrypt protocol. This executes the
-// oncrypt handshake and returns an encrypted writer. Stream read is required to complete
-// the handshake, but not for writing data.
+// oncrypt handshake and returns an encrypted writer. Stream reading is required to
+// complete the handshake, but not for writing data.
 //
-// The key must be 16, 24, or 32 bytes, resulting in AES-128, AES-192, or AES-256
-// encryption respectively.
+// The key can either be a []byte string or a NamedKey. NamedKey allows you to provide a
+// name for the key. Otherwise, "default" is used. The key must be 16, 24, or 32 bytes,
+// resulting in AES-128, AES-192, or AES-256 encryption respectively.
+//
+// The key name must be 8 bytes or less. This is used to select a key in a keyring on the
+// decryption side.
 //
 // Errors:
 //
 //   - ErrInitFailed: invalid args (key size) or failed handshake. May contain wrapped
 //     error.
-func EncryptStream(key []byte, stream io.ReadWriter) (io.ReadWriter, error) {
+//   - ErrNoKey: remote does not recognize the key.
+func EncryptStream[KeyInput interface{ ~[]byte | NamedKey }](key KeyInput, stream io.ReadWriter) (io.ReadWriter, error) {
+	// this is just a wrapper for type constraints
+	var keybytes []byte
+	var keyName string
+
+	switch keyval := any(key).(type) {
+	case []byte:
+		keybytes = keyval
+		keyName = "default"
+	case NamedKey:
+		keybytes = keyval.Key
+		keyName = keyval.Name
+	default:
+		return nil, fmt.Errorf("%w: invalid key", ErrInitFailed)
+	}
+
+	return encryptStream(keybytes, keyName, stream)
+}
+
+func encryptStream(key []byte, keyName string, stream io.ReadWriter) (io.ReadWriter, error) {
+	if len(keyName) > 8 {
+		return nil, fmt.Errorf("%w: key name too long", ErrInitFailed)
+	}
+
 	blockCipher, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to create cipher: %w", ErrInitFailed, err)
@@ -95,14 +128,14 @@ func EncryptStream(key []byte, stream io.ReadWriter) (io.ReadWriter, error) {
 
 	remoteSalt := generateSalt(aes.BlockSize)
 
-	// Version
+	// Protocol Identifier
 	if _, err := stream.Write([]byte("ON_1")); err != nil {
 		return nil, fmt.Errorf("%w: failed to write protocol id: %w", ErrInitFailed, err)
 	}
 
 	// Remote Salt
 	if _, err := stream.Write(remoteSalt); err != nil {
-		return nil, fmt.Errorf("%w: failed to write nonce: %w", ErrInitFailed, err)
+		return nil, fmt.Errorf("%w: failed to write remote salt: %w", ErrInitFailed, err)
 	}
 
 	// Read local salt
@@ -112,6 +145,32 @@ func EncryptStream(key []byte, stream io.ReadWriter) (io.ReadWriter, error) {
 			err = io.ErrUnexpectedEOF
 		}
 		return nil, fmt.Errorf("%w: failed to read client salt: %w", ErrInitFailed, err)
+	}
+
+	// Send key name
+	{
+		var keyNamePadded [8]byte
+		copy(keyNamePadded[:], keyName)
+		if _, err := stream.Write(keyNamePadded[:]); err != nil {
+			return nil, fmt.Errorf("%w: failed to write key name: %w", ErrInitFailed, err)
+		}
+	}
+
+	// Recv status
+	{
+		var status [4]byte
+		if _, err := io.ReadFull(stream, status[:]); err != nil {
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, fmt.Errorf("%w: failed to read status: %w", ErrInitFailed, err)
+		}
+
+		if string(status[:]) == "FAIL" {
+			return nil, ErrMissingKey
+		} else if string(status[:]) != "OKAY" {
+			return nil, fmt.Errorf("%w: unexpected status", ErrInitFailed)
+		}
 	}
 
 	encrypter := &encrypter{
@@ -127,10 +186,20 @@ func EncryptStream(key []byte, stream io.ReadWriter) (io.ReadWriter, error) {
 		buffer: make([]byte, 2048),
 	}
 
-	hash := sha256.Sum256(append(clientSalt[:], key...))
-	if _, err := encrypter.Write(hash[:]); err != nil {
-		return nil, fmt.Errorf("%w: failed to write key hash: %w", ErrInitFailed, err)
+	cipherTestRecv := make([]byte, 16)
+	if _, err := io.ReadFull(decrypter, cipherTestRecv); err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, fmt.Errorf("%w: failed to read cipher test: %w", ErrInitFailed, err)
 	}
 
-	return &combinedStream{encrypter, decrypter}, nil
+	if _, err := encrypter.Write(cipherTestRecv); err != nil {
+		return nil, fmt.Errorf("%w: failed to write cipher test: %w", ErrInitFailed, err)
+	}
+
+	return &struct {
+		io.Reader
+		io.Writer
+	}{decrypter, encrypter}, nil
 }
