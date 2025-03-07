@@ -29,14 +29,16 @@ type MessageSubscriber struct {
 	handler MessageHandler
 }
 
+// This is a channel that can be closed to raise a signal. raise() closes the channel and
+// can be called multiple times (successive calls doing nothing).
 type signal struct {
 	C      chan struct{}
 	closer sync.Once
 }
 
-func (s *signal) wait() {
-	<-s.C
-}
+// func (s *signal) wait() {
+// 	<-s.C
+// }
 
 func (s *signal) raise() {
 	s.closer.Do(func() {

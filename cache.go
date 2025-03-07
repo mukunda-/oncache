@@ -144,44 +144,12 @@ func (c *dcache) checkAndRunClean() bool {
 	return true
 }
 
+// Delete expired keys. This is called automatically if you specify a cleanupPeriod.
 func (c *dcache) Clean() {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
 	c.data.Clean()
-
-	/*
-		now := time.Now().Unix()
-
-		filter := mapchain.NewFilterJob(c.data, func(value any) bool {
-			if value == nil {
-				return true
-			}
-
-			exp := value.(cacheValue).expiration
-			if exp == 0 {
-				return false
-			}
-
-			return now > c.epoch+int64(exp)
-		})
-
-		go func() {
-
-			for {
-				_, _, done := filter.Run()
-				if done {
-					return
-				}
-				select {
-				case <-time.After(100 * time.Millisecond):
-					// continue
-				case <-c.parent.shutdownSignal.C:
-					return
-				}
-			}
-		}()
-	*/
 }
 
 // Options for NewCache. All options can be `nil` which indicates the default value.
