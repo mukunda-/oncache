@@ -229,6 +229,11 @@ func (s *Sieve) translateExpiresValue(ttl time.Duration) uint32 {
 // Update a value in the cache by key. `ttl` is an expiration time. 0 = no
 // expiration.
 func (s *Sieve) Set(key string, value any, ttl time.Duration) {
+	if value == nil {
+		s.Delete(key)
+		return
+	}
+
 	rec := s.keys[key]
 	if rec != 0 {
 

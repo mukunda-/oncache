@@ -1027,8 +1027,8 @@ func TestBadKey(t *testing.T) {
 
 func TestListenerCrash(t *testing.T) {
 	// [SPEC] If the listener crashes, the system should attempt to restart it.
-	oncache.SetDebugCrashListener(true)
-	defer oncache.SetDebugCrashListener(false)
+	oncache.SetDebugListenerCrash(true)
+	defer oncache.SetDebugListenerCrash(false)
 
 	logger := captureLogger{}
 	logger.Install()
@@ -1054,8 +1054,8 @@ func TestListenerCrashRecover(t *testing.T) {
 	}(oncache.ProcessPanicRecoveryDelay)
 	oncache.ProcessPanicRecoveryDelay = time.Millisecond * 5
 
-	oncache.SetDebugCrashListener(true)
-	defer oncache.SetDebugCrashListener(false)
+	oncache.SetDebugListenerCrash(true)
+	defer oncache.SetDebugListenerCrash(false)
 
 	logger := captureLogger{}
 	logger.Install()
@@ -1074,7 +1074,7 @@ func TestListenerCrashRecover(t *testing.T) {
 
 	// [SPEC] The system will repeatedly try to recover failing processes.
 
-	oncache.SetDebugCrashListener(false)
+	oncache.SetDebugListenerCrash(false)
 	waitFor(t, func() bool {
 		return node.ListenerStarted()
 	}, time.Second*1)

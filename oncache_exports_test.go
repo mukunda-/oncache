@@ -5,6 +5,6 @@
 
 package oncache
 
-func SetDebugCrashListener(val bool) {
+func SetDebugListenerCrash(val bool) {
 	debugCrashListener = val
 }

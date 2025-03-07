@@ -517,3 +517,61 @@ func TestNumKeys(t *testing.T) {
 	s.Clean()
 	assert(t, s.NumKeys() == 0)
 }
+
+func TestDelete(t *testing.T) {
+	s := sieve.NewSieve(3)
+	s.Set("a", 1, 0)
+	s.Set("b", 1, 0)
+	s.Set("c", 1, 0)
+
+	// c b a
+	//       ↑
+
+	s.Set("d", 1, 0) // evicts "a"
+
+	// d c b
+	//     ↑
+	// hand is at "b"
+	s.Delete("b")
+	// hand is moved to "c" by delete
+	// d c
+	//   ↑
+
+	assert(t, s.Get("a") == nil)
+	assert(t, s.Get("b") == nil)
+
+	s.Set("e", 1, 0)
+	// e d c
+	//     ↑
+
+	s.Set("f", 1, 0)
+	// f e d  - c is evicted
+	//     ↑
+	assert(t, s.Get("c") == nil)
+
+	s.Delete("e")
+	s.Delete("f") // hand is moved to NULL
+
+	s.Set("g", 1, 0)
+	s.Set("h", 1, 0)
+	s.Set("i", 1, 0)
+	s.Set("j", 1, 0) // evicts "g"
+
+	// j i h
+	//     ↑
+
+	assert(t, s.Get("g") == nil)
+	assert(t, s.Get("h") == 1)
+	assert(t, s.Get("i") == 1)
+	assert(t, s.Get("j") == 1)
+}
+
+func TestDeleteFromSet(t *testing.T) {
+	// [SPEC] Setting a value to nil is the same as calling Delete.
+
+	s := sieve.NewSieve(3)
+	s.Set("a", 1, 0)
+	s.Set("a", nil, 0)
+
+	assert(t, s.NumKeys() == 0)
+}
