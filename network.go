@@ -23,38 +23,50 @@ import (
 // is processed.
 var PeerQueueSize = 100
 
+// If the dialer times out, then it will be retried later. If it repeatedly times out,
+// then the node is removed from the pool.
+var DialerTimeout = 10 * time.Second
+
+// How long to delay before retrying to set up a listener after failing to start.
+var ListenerFailedStartRetryTime = time.Minute
+
 type peerSendQueue chan string
 
 type networkPeer struct {
-	address string
-	queue   peerSendQueue
-	cancel  signal
+	host   string
+	queue  peerSendQueue
+	cancel signal
 }
 
-var DialerTimeout = 10 * time.Second
-
-func (oc *Oncache) registerPeer(address string) {
+func (oc *Oncache) registerPeer(host string, fromSub bool) {
 	oc.peerLock.Lock()
 	defer oc.peerLock.Unlock()
 
-	if _, ok := oc.networkPeers[address]; ok {
+	if _, ok := oc.networkPeers[host]; ok {
+		logDebug(fmt.Sprintf("Peer %s is already registered.", host))
 		return
 	}
 
 	queue := make(chan string, PeerQueueSize)
-	oc.networkPeers[address] = &networkPeer{address, queue, newSignal()}
+	if !fromSub {
+		// We don't request SUB if this registration was from a SUB. The peer should already
+		// be aware of us (as it connected to us).
+		queue <- "1 SUB"
+	}
+
+	oc.networkPeers[host] = &networkPeer{host, queue, newSignal()}
 
 	oc.activeWork.Add(1)
-	go oc.peerDeliveryProcess(address, queue)
+	go oc.peerDeliveryProcess(host, queue)
 }
 
-func (oc *Oncache) removePeer(address string) {
+func (oc *Oncache) removePeer(host string) {
 	oc.peerLock.Lock()
 	defer oc.peerLock.Unlock()
 
-	if peer, ok := oc.networkPeers[address]; ok {
+	if peer, ok := oc.networkPeers[host]; ok {
 		peer.cancel.raise()
-		delete(oc.networkPeers, address)
+		delete(oc.networkPeers, host)
 	}
 }
 
@@ -65,12 +77,12 @@ func (oc *Oncache) removePeer(address string) {
 // Messages cannot contain line breaks. LF is the stream delimiter.
 func (oc *Oncache) DispatchMessage(channel string, message string) {
 	if channel == "" {
-		logError("Attempted to send message on empty channel " + string(debug.Stack()))
+		logError("Attempted to send message on empty channel; " + string(debug.Stack()))
 		return
 	}
 
 	if strings.Contains(channel, "\n") || strings.Contains(message, "\n") {
-		logError("Attempted to send message with line break.")
+		logError("Attempted to send message with line break;" + string(debug.Stack()))
 		return
 	}
 
@@ -79,7 +91,7 @@ func (oc *Oncache) DispatchMessage(channel string, message string) {
 }
 
 // Handle a message on channel "1" (system).
-func (oc *Oncache) handleChannel1Message(message string) {
+func (oc *Oncache) handleChannel1Message(host string, message string) {
 	fields := strings.Fields(message)
 	if len(fields) < 1 {
 		logError("Received invalid message on channel 1 (too short).")
@@ -95,6 +107,9 @@ func (oc *Oncache) handleChannel1Message(message string) {
 			defer ManagerLock.Unlock()
 		}
 		oc.deleteLocal(rest)
+	} else if cmd == "SUB" {
+		logDebug(fmt.Sprintf("Registering peer %s from SUB command.", host))
+		oc.registerPeer(host, true)
 	} else {
 		logError(fmt.Sprintf("Received unknown command on channel 1: %s", message))
 	}
@@ -107,7 +122,7 @@ func (oc *Oncache) handleMessageReceived(host string, fullMessage string) {
 	rest = strings.TrimSpace(rest)
 
 	if channel == "1" {
-		oc.handleChannel1Message(rest)
+		oc.handleChannel1Message(host, rest)
 	}
 
 	oc.subscriptionLock.Lock()
@@ -146,13 +161,13 @@ func (oc *Oncache) broadcastMessage(message string) {
 	oc.peerLock.RLock()
 	defer oc.peerLock.RUnlock()
 
-	for address, peer := range oc.networkPeers {
+	for host, peer := range oc.networkPeers {
 		select {
 		case peer.queue <- message:
 		default:
 			// If the queue is full, drop the message. This may happen if a peer becomes
 			// unresponsive. It will either recover or be dropped from the system later.
-			logError(fmt.Sprintf("[%s] Peer queue full, dropping message.", address))
+			logError(fmt.Sprintf("[%s] Peer queue full, dropping message.", host))
 		}
 	}
 }
@@ -207,14 +222,14 @@ func (br *backoffRetry) get() float64 {
 
 // Process for connecting to a peer and sending messages. This process is started per
 // peer.
-func (oc *Oncache) peerDeliveryProcess(address string,
+func (oc *Oncache) peerDeliveryProcess(host string,
 	sendQueue chan string) {
 
 	var conn net.Conn
 	var encrypter io.Writer
 
 	defer oc.onProcessCompleted("peerProcess",
-		func() { oc.peerDeliveryProcess(address, sendQueue) },
+		func() { oc.peerDeliveryProcess(host, sendQueue) },
 	)
 	defer func() {
 		if conn != nil {
@@ -233,25 +248,26 @@ restart:
 
 	// Repeat this block until we establish a connection. If we can't get one in a timely
 	// manner, then this peer will be dropped.
-	startTime := time.Now().UnixMilli()
+	dialTimeout := time.Now().Add(DialerTimeout)
+
 	for conn == nil {
 		var err error
-		conn, err = dialer.Dial("tcp", address)
+		conn, err = dialer.Dial("tcp", host)
 		if err != nil {
 
-			if time.Now().UnixMilli()-startTime > DialerTimeout.Milliseconds() {
-				logError(fmt.Sprintf("[%s] Dial timeout; removing peer.", address))
-				oc.removePeer(address)
+			if time.Now().After(dialTimeout) {
+				logError(fmt.Sprintf("[%s] Dial timeout; removing peer.", host))
+				oc.removePeer(host)
 				return
 			}
 
 			delay := int(backoff.get())
-			logError(fmt.Sprintf("[%s] Error dialing %s; retrying in %d secs.", address, err, delay))
+			logError(fmt.Sprintf("[%s] Error dialing %s; retrying in %d secs.", host, err, delay))
 			select {
 			case <-time.After(time.Duration(delay) * time.Second):
 			case <-oc.stopSignal.C:
 				return
-			case <-oc.networkPeers[address].cancel.C:
+			case <-oc.networkPeers[host].cancel.C:
 				return
 			}
 			continue
@@ -262,7 +278,7 @@ restart:
 		// Connection established.
 		encrypter, err = oncrypt.EncryptStream(oc.encryptionKey, conn)
 		if err != nil {
-			logError(fmt.Sprintf("[%s] Error starting encrypted stream: %v; dropping messages and restarting", address, err))
+			logError(fmt.Sprintf("[%s] Error starting encrypted stream: %v; dropping messages and restarting", host, err))
 			conn.Close()
 			conn = nil
 			goto restart
@@ -270,7 +286,7 @@ restart:
 
 		_, err = encrypter.Write([]byte("v1 " + oc.hostWithPort() + "\n"))
 		if err != nil {
-			logError(fmt.Sprintf("[%s] Failed writing connection hello: %v; restarting", address, err))
+			logError(fmt.Sprintf("[%s] Failed writing connection hello: %v; restarting", host, err))
 			conn.Close()
 			conn = nil
 			encrypter = nil
@@ -280,31 +296,12 @@ restart:
 
 	_, err := encrypter.Write([]byte(messages))
 	if err != nil {
-		logError(fmt.Sprintf("[%s] Failed writing messages: %v; restarting.", address, err))
+		logError(fmt.Sprintf("[%s] Failed writing messages: %v; restarting.", host, err))
 		conn.Close()
 		conn = nil
 		encrypter = nil
 	}
 	goto restart
-}
-
-func (oc *Oncache) Subscribe(channel string, handler MessageHandler) MessageSubscriberId {
-	oc.subscriptionLock.Lock()
-	defer oc.subscriptionLock.Unlock()
-
-	if _, ok := oc.subscriptions[channel]; !ok {
-		oc.subscriptions[channel] = make([]MessageSubscriber, 0)
-	}
-
-	id := oc.nextSubscriptionId
-	oc.nextSubscriptionId++
-
-	oc.subscriptions[channel] = append(oc.subscriptions[channel], MessageSubscriber{
-		id:      id,
-		handler: handler,
-	})
-
-	return id
 }
 
 // This process listens for connections and spawns goroutines for handling clients. When
@@ -322,8 +319,18 @@ restart:
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", oc.listenPort))
 	if err != nil {
-		logError(fmt.Sprintf("Failed to start listener: %s; retrying in 60 seconds.", err))
-		time.Sleep(60 * time.Second)
+		logError(fmt.Sprintf("Failed to start listener: %s; retrying in %d seconds.",
+			err,
+			int(ListenerFailedStartRetryTime.Seconds())))
+
+		select {
+		case <-time.After(ListenerFailedStartRetryTime):
+			// Okay, retry.
+		case <-oc.stopSignal.C:
+			// Shutdown raised during sleep, exit.
+			return
+		}
+
 		goto restart
 	}
 
@@ -336,7 +343,7 @@ restart:
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				if err != net.ErrClosed {
+				if !errors.Is(err, net.ErrClosed) {
 					logError(fmt.Sprintf("Listener accept failed: %s.", err))
 				} else {
 					logInfo("Listener closed.")
@@ -431,4 +438,48 @@ func (oc *Oncache) handleConnection(conn net.Conn) {
 	if err := scanner.Err(); err != nil && !errors.Is(scanner.Err(), io.EOF) {
 		logError(fmt.Sprintf("[%s] Connection closed with error: %s", fromAddress, scanner.Err().Error()))
 	}
+}
+
+// Subscribe to messages on a channel. The handler will be called when a message is
+// received on the specified channel. If the channel is empty, the handler will be called
+// for all messages on any channel.
+func (oc *Oncache) Subscribe(channel string, handler MessageHandler) MessageSubscriberId {
+	oc.subscriptionLock.Lock()
+	defer oc.subscriptionLock.Unlock()
+
+	if _, ok := oc.subscriptions[channel]; !ok {
+		oc.subscriptions[channel] = make([]MessageSubscriber, 0)
+	}
+
+	id := oc.nextSubscriptionId
+	oc.nextSubscriptionId++
+
+	oc.subscriptions[channel] = append(oc.subscriptions[channel], MessageSubscriber{
+		id:      id,
+		handler: handler,
+	})
+
+	return id
+}
+
+// Remove a subscription. Pass the ID returned by Subscribe. The channel must also match
+// what channel was subscribed to, or "" if it was a global subscription.
+func (oc *Oncache) Unsubscribe(channel string, id MessageSubscriberId) {
+	oc.subscriptionLock.Lock()
+	defer oc.subscriptionLock.Unlock()
+
+	subs := oc.subscriptions[channel]
+	for i, sub := range subs {
+		if sub.id == id {
+			oc.subscriptions[channel] = append(subs[:i], subs[i+1:]...)
+			return
+		}
+	}
+}
+
+// Returns the number of peers we have registered in the network (excluding this node).
+func (oc *Oncache) NumPeers() int {
+	oc.peerLock.RLock()
+	defer oc.peerLock.RUnlock()
+	return len(oc.networkPeers)
 }

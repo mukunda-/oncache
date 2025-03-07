@@ -479,3 +479,41 @@ func TestSievesWithRandomTtl(t *testing.T) {
 		}
 	}
 }
+
+func TestNumKeys(t *testing.T) {
+	useTime(0)
+	defer restoreTime()
+
+	s := sieve.NewSieve(10)
+
+	// [SPEC] An expiration value of 1 will be rounded up to 1 second.
+
+	s.Set("a", 1, 1)
+	s.Set("b", 1, 1)
+	s.Set("c", 1, 1)
+
+	assert(t, s.NumKeys() == 3)
+
+	s.Reset()
+	assert(t, s.NumKeys() == 0)
+
+	s.Set("a", 1, 1)
+	s.Set("b", 1, 1)
+	s.Set("c", 1, time.Second*4)
+
+	advanceTime(1)
+
+	// [SPEC] NumKeys reports the number of keys in the data structure and does not check
+	//        for expiration.
+	assert(t, s.NumKeys() == 3)
+
+	s.Get("a") // this should expire and remove "a"
+	assert(t, s.NumKeys() == 2)
+
+	s.Clean()
+	assert(t, s.NumKeys() == 1)
+
+	advanceTime(4)
+	s.Clean()
+	assert(t, s.NumKeys() == 0)
+}

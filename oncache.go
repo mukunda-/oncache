@@ -166,7 +166,7 @@ func (oc *Oncache) Connect(hosts []string) {
 			logWarn("Remote hostname matches own (" + host + ").")
 		}
 
-		oc.registerPeer(host)
+		oc.registerPeer(host, false)
 	}
 }
 
@@ -277,6 +277,9 @@ func (oc *Oncache) onProcessCompleted(name string, process func()) {
 	}
 }
 
+var CleanupPollingPeriod = time.Minute
+var CleanupPollingBetweenPeriod = time.Millisecond * 200
+
 // Process that triggers automatic Clean calls.
 func (oc *Oncache) cleaningProcess() {
 	defer oc.onProcessCompleted(
@@ -286,7 +289,7 @@ func (oc *Oncache) cleaningProcess() {
 
 	for {
 		select {
-		case <-time.After(time.Minute):
+		case <-time.After(CleanupPollingPeriod):
 			// Wait 60 seconds between cleanup cycles.
 			caches := oc.GetAllCaches()
 			for _, cache := range caches {
@@ -300,7 +303,7 @@ func (oc *Oncache) cleaningProcess() {
 				}
 
 				select {
-				case <-time.After(time.Millisecond * 200):
+				case <-time.After(CleanupPollingBetweenPeriod):
 					// Wait 200ms between processing caches, so we don't fire off several
 					// cleanups at once.
 				case <-oc.stopSignal.C:

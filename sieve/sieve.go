@@ -218,10 +218,15 @@ func (s *Sieve) translateExpiresValue(ttl time.Duration) uint32 {
 	if ttl == 0 {
 		return 0
 	}
-	return uint32((Now() - s.epoch + int64(ttl.Seconds())) << 1)
+	expires := (Now() - s.epoch + int64(ttl.Seconds()))
+	if expires <= 0 {
+		expires = 1
+	}
+
+	return uint32(expires << 1)
 }
 
-// Update a value in the cache by key. `ttl` is an expiration time in seconds. 0 = no
+// Update a value in the cache by key. `ttl` is an expiration time. 0 = no
 // expiration.
 func (s *Sieve) Set(key string, value any, ttl time.Duration) {
 	rec := s.keys[key]
@@ -302,4 +307,9 @@ func (s *Sieve) Clean() {
 		}
 		rec = next
 	}
+}
+
+// Return the number of set keys. Includes expired keys until they are cleaned up.
+func (s *Sieve) NumKeys() int {
+	return len(s.keys)
 }

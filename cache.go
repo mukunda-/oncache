@@ -59,6 +59,9 @@ type Cache interface {
 
 	// Discard all keys in this local cache only (do not propagate to other nodes).
 	ResetLocal()
+
+	// Diagnostic function that returns the number of keys set in the key table.
+	NumKeys() int
 }
 
 type dcache struct {
@@ -152,6 +155,12 @@ func (c *dcache) Clean() {
 	c.data.Clean()
 }
 
+// Returns the number of keys in the cache. Counts expired keys too. Expired keys are not
+// removed until an operation touches them.
+func (c *dcache) NumKeys() int {
+	return c.data.NumKeys()
+}
+
 // Options for NewCache. All options can be `nil` which indicates the default value.
 type NewCacheOptions struct {
 	// The max amount of keys the cache can hold. Must be 1-65535. Default is 1000.
@@ -196,14 +205,20 @@ func (oc *Oncache) NewCache(name string, options ...NewCacheOptions) Cache {
 		}
 		if opt.DefaultExpiration != 0 {
 			cache.defaultExpiration = int32(opt.DefaultExpiration.Seconds())
-			if cache.defaultExpiration < 0 {
+			if opt.DefaultExpiration < 0 {
 				cache.defaultExpiration = 0
+			} else if cache.defaultExpiration == 0 {
+				// Round up to 1.
+				cache.defaultExpiration = 1
 			}
 		}
 		if opt.CleanupPeriod != 0 {
 			cache.cleanupPeriod = int32(opt.CleanupPeriod.Seconds())
-			if cache.cleanupPeriod < 0 {
+			if opt.CleanupPeriod < 0 {
 				cache.cleanupPeriod = 0
+			} else if cache.cleanupPeriod == 0 {
+				// Round up to 1.
+				cache.cleanupPeriod = 1
 			}
 		}
 	}
