@@ -198,9 +198,6 @@ func (oc *Oncache) Delete(key string) {
 // Returned when the key is not the expected format.
 var ErrInvalidKey = errors.New("invalid key; must be 16, 24, or 32 bytes")
 
-// If you call Init twice.
-var ErrAlreadyInitialized = errors.New("already initialized")
-
 func (oc *Oncache) hostWithPort() string {
 	if strings.Contains(oc.hostname, ":") {
 		return oc.hostname
@@ -219,11 +216,11 @@ func (oc *Oncache) hostWithPort() string {
 // the hostname.
 //
 // Errors:
-// - ErrAlreadyInitialized: If the system is already initialized.
 // - ErrInvalidKey: If the key length is invalid.
 func (oc *Oncache) Start(key []byte, hostname string) error {
 	if oc.live {
-		return ErrAlreadyInitialized
+		logError("Start() called after already initialized.")
+		return nil
 	}
 
 	if len(key) != 16 && len(key) != 24 && len(key) != 32 {
@@ -283,7 +280,7 @@ var CleanupPollingBetweenPeriod = time.Millisecond * 200
 // Process that triggers automatic Clean calls.
 func (oc *Oncache) cleaningProcess() {
 	defer oc.onProcessCompleted(
-		"garbageCollectionProcess",
+		"cleaningProcess",
 		func() { oc.cleaningProcess() },
 	)
 

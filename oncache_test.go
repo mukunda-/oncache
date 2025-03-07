@@ -1,6 +1,13 @@
+//////////////////////////////////////////////////////////////////////////////////////////
+// oncache (C) 2025 Mukunda Johnson (mukunda.com)
+// Licensed under MIT. See LICENSE file.
+//////////////////////////////////////////////////////////////////////////////////////////
+
 package oncache_test
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
@@ -973,4 +980,47 @@ func TestStartStopImmediate(t *testing.T) {
 	c.Stop()
 	endOfStop := time.Now()
 	assert(t, endOfStop.Sub(startOfStop) < time.Second)
+}
+
+func TestDoubleStart(t *testing.T) {
+	nodes := createCluster(2)
+	defer shutdownCluster(nodes)
+
+	logger := captureLogger{}
+	logger.Install()
+	defer logger.Uninstall()
+
+	// [SPEC] If Start is called more than once during the lifetime, an error is logged and
+	// the call is ignored.
+
+	nodes[0].Start([]byte("3333333333333333"), "127.0.0.1")
+	nodes[0].Start([]byte("3333333333333333"), "127.0.0.1")
+
+	assert(t, logger.Count("ERROR.*initialized") == 2)
+
+	// We want to make sure that the system is still functioning normally after those two
+	// bogus Start calls.
+	exit := make(chan int)
+
+	nodes[0].Subscribe("test", func(host string, channel string, message string) {
+		exit <- 1
+	})
+
+	nodes[1].DispatchMessage("test", "test")
+
+	<-exit
+}
+
+func TestBadKey(t *testing.T) {
+	// [SPEC] Oncache will reject Start if the key is invalid.
+
+	for i := 0; i < 100; i++ {
+		if i != 16 && i != 24 && i != 32 {
+			node := oncache.New()
+			node.SetPort(14250)
+			assert(t,
+				errors.Is(node.Start(bytes.Repeat([]byte{0}, i), "127.0.0.1"),
+					oncache.ErrInvalidKey))
+		}
+	}
 }
