@@ -63,19 +63,6 @@ func (e *encrypter) Write(data []byte) (n int, err error) {
 	return written, nil
 }
 
-type combinedStream struct {
-	out *encrypter
-	in  *decrypter
-}
-
-func (e *combinedStream) Write(data []byte) (n int, err error) {
-	return e.out.Write(data)
-}
-
-func (e *combinedStream) Read(data []byte) (n int, err error) {
-	return e.in.Read(data)
-}
-
 type NamedKey struct {
 	Name string
 	Key  []byte

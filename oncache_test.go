@@ -1024,3 +1024,58 @@ func TestBadKey(t *testing.T) {
 		}
 	}
 }
+
+func TestListenerCrash(t *testing.T) {
+	// [SPEC] If the listener crashes, the system should attempt to restart it.
+	oncache.SetDebugCrashListener(true)
+	defer oncache.SetDebugCrashListener(false)
+
+	logger := captureLogger{}
+	logger.Install()
+	defer logger.Uninstall()
+
+	nodes := createCluster(1)
+	defer shutdownCluster(nodes)
+
+	time.Sleep(time.Millisecond * 100)
+
+	assert(t, logger.Count("ERROR.*listener.*panic") > 0)
+
+	// This should cancel the restart immediately.
+	startOfStop := time.Now()
+	nodes[0].Stop()
+	endOfStop := time.Now()
+	assert(t, endOfStop.Sub(startOfStop) < time.Second)
+}
+
+func TestListenerCrashRecover(t *testing.T) {
+	defer func(prc time.Duration) {
+		oncache.ProcessPanicRecoveryDelay = prc
+	}(oncache.ProcessPanicRecoveryDelay)
+	oncache.ProcessPanicRecoveryDelay = time.Millisecond * 5
+
+	oncache.SetDebugCrashListener(true)
+	defer oncache.SetDebugCrashListener(false)
+
+	logger := captureLogger{}
+	logger.Install()
+	defer logger.Uninstall()
+
+	node := oncache.New()
+	node.SetPort(14250)
+	node.Start([]byte("1234567890123456"), "127.0.0.1")
+	defer node.Stop()
+
+	time.Sleep(time.Millisecond * 100)
+
+	assert(t, logger.Count("ERROR.*listener.*panic") > 0)
+
+	// OK, the listener is panicking. Let's recover it.
+
+	// [SPEC] The system will repeatedly try to recover failing processes.
+
+	oncache.SetDebugCrashListener(false)
+	waitFor(t, func() bool {
+		return node.ListenerStarted()
+	}, time.Second*1)
+}

@@ -255,5 +255,8 @@ func decryptStream(key any, stream io.ReadWriter) (io.ReadWriter, error) {
 	// Strip NUL from the output from this point forward (switching to TEXT mode).
 	decrypter.StripNul = true
 
-	return &combinedStream{encrypter, decrypter}, nil
+	return &struct {
+		io.Reader
+		io.Writer
+	}{decrypter, encrypter}, nil
 }

@@ -30,6 +30,11 @@ var DialerTimeout = 10 * time.Second
 // How long to delay before retrying to set up a listener after failing to start.
 var ListenerFailedStartRetryTime = time.Minute
 
+// Test diagnostic flags.
+
+// This will cause the listener process to panic during the startup phase.
+var debugCrashListener = false
+
 type peerSendQueue chan string
 
 type networkPeer struct {
@@ -228,7 +233,7 @@ func (oc *Oncache) peerDeliveryProcess(host string,
 	var conn net.Conn
 	var encrypter io.Writer
 
-	defer oc.onProcessCompleted("peerProcess",
+	defer oc.onProcessCompleted("peerDeliveryProcess",
 		func() { oc.peerDeliveryProcess(host, sendQueue) },
 	)
 	defer func() {
@@ -309,15 +314,27 @@ restart:
 func (oc *Oncache) listenerProcess() {
 	// If anything causes an unexpected panic, try to restart.
 	defer oc.onProcessCompleted("listenerProcess", func() { oc.listenerProcess() })
+	var listener net.Listener
+	var err error
+	defer func() {
+		if listener != nil {
+			listener.Close()
+		}
+	}()
 
 restart:
+	// Make sure we're in a good closed state after a restart.
+	if listener != nil {
+		listener.Close()
+	}
+
 	select {
 	case <-oc.stopSignal.C:
 		return
 	default:
 	}
 
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", oc.listenPort))
+	listener, err = net.Listen("tcp", fmt.Sprintf(":%d", oc.listenPort))
 	if err != nil {
 		logError(fmt.Sprintf("Failed to start listener: %s; retrying in %d seconds.",
 			err,
@@ -332,6 +349,10 @@ restart:
 		}
 
 		goto restart
+	}
+
+	if debugCrashListener {
+		panic("debugCrashListener")
 	}
 
 	logInfo(fmt.Sprintf("Listening on port %d", oc.listenPort))

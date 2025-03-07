@@ -252,17 +252,20 @@ func (oc *Oncache) Stop() {
 	oc.activeWork.Wait()
 }
 
+var ProcessPanicRecoveryDelay = time.Second * 60
+
 // Deferred call within processes to either
 // (A) recover from panic and restart
 // (B) exit normally and decrement the active work.
 func (oc *Oncache) onProcessCompleted(name string, process func()) {
 	if r := recover(); r != nil {
-		logError(fmt.Sprintf("[%s] recovered from panic: %v; restarting in 60 seconds", name, r))
+		logError(fmt.Sprintf("[%s] recovered from panic: %v; restarting in %d seconds", name, r, int(ProcessPanicRecoveryDelay.Seconds())))
 		logError(string(debug.Stack()))
 		select {
-		case <-time.After(time.Second * 60):
-			// Delay 60 seconds for restart.
+		case <-time.After(ProcessPanicRecoveryDelay):
+			// Delay before restart.
 		case <-oc.stopSignal.C:
+			// Shutdown signal was received during delay.
 			logInfo("[%s] Shutdown signal received. Cancelling restart.")
 			oc.activeWork.Done()
 			return
