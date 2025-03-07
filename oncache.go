@@ -72,7 +72,7 @@ type Oncache struct {
 
 	// This is closed when the system is shutting down. All processes should check this
 	// during sleep periods.
-	shutdownSignal signal
+	stopSignal signal
 
 	// Set during init
 	// ---------------
@@ -101,6 +101,10 @@ type Oncache struct {
 
 	subscriptionLock sync.Mutex
 
+	// This is called "initial" because it only tracks the first listener iteration. If the
+	// listener crashes and is restarting, this would will be already raised.
+	initialListenerStarted signal
+
 	// Grouped by channels. Empty entry "" matches all channels.
 	subscriptions      map[string][]MessageSubscriber
 	nextSubscriptionId int
@@ -118,15 +122,24 @@ func (oc *Oncache) SetPort(port int) {
 // then call [Init] to start it.
 func New() *Oncache {
 	return &Oncache{
-		listenPort:     DefaultPort,
-		activeWork:     &sync.WaitGroup{},
-		caches:         make(map[string]Cache),
-		shutdownSignal: signal{C: make(chan struct{})},
+		listenPort: DefaultPort,
+		activeWork: &sync.WaitGroup{},
+		caches:     make(map[string]Cache),
+		stopSignal: newSignal(),
 
 		networkPeers:         make(map[string]*networkPeer),
 		outgoingMessageQueue: make(chan string, 1000),
 		incomingMessageQueue: make(chan string, 1000),
+
+		initialListenerStarted: newSignal(),
+		subscriptions:          make(map[string][]MessageSubscriber),
 	}
+}
+
+// Returns true if the listener has started on the port. This is mainly useful for testing
+// purposes, ensuring that a round of clusters is ready to accept connections.
+func (oc *Oncache) ListenerStarted() bool {
+	return oc.initialListenerStarted.raised()
 }
 
 // Connect this instance to the list of hosts given. This function can be called multiple
@@ -206,7 +219,7 @@ func (oc *Oncache) hostWithPort() string {
 // Errors:
 // - ErrAlreadyInitialized: If the system is already initialized.
 // - ErrInvalidKey: If the key length is invalid.
-func (oc *Oncache) Init(key []byte, hostname string) error {
+func (oc *Oncache) Start(key []byte, hostname string) error {
 	if oc.live {
 		return ErrAlreadyInitialized
 	}
@@ -221,7 +234,6 @@ func (oc *Oncache) Init(key []byte, hostname string) error {
 	oc.encryptionKeyName = "default"
 	oc.hostname = hostname
 	oc.live = true
-	oc.shutdownSignal = newSignal()
 
 	oc.activeWork.Add(3)
 	go oc.messageSendProcess()
@@ -233,9 +245,9 @@ func (oc *Oncache) Init(key []byte, hostname string) error {
 
 // Shut down the system. Called during application teardown. This will block until related
 // goroutines quit.
-func (oc *Oncache) Shutdown() {
+func (oc *Oncache) Stop() {
 	// When the shutdown signal is submitted, all processes should exit soon.
-	oc.shutdownSignal.raise()
+	oc.stopSignal.raise()
 
 	// Wait for all processes to exit.
 	oc.activeWork.Wait()
@@ -251,7 +263,7 @@ func (oc *Oncache) onProcessCompleted(name string, process func()) {
 		select {
 		case <-time.After(time.Second * 60):
 			// Delay 60 seconds for restart.
-		case <-oc.shutdownSignal.C:
+		case <-oc.stopSignal.C:
 			logInfo("[%s] Shutdown signal received. Cancelling restart.")
 			oc.activeWork.Done()
 			return
@@ -289,12 +301,12 @@ func (oc *Oncache) cleaningProcess() {
 				case <-time.After(time.Millisecond * 200):
 					// Wait 200ms between processing caches, so we don't fire off several
 					// cleanups at once.
-				case <-oc.shutdownSignal.C:
+				case <-oc.stopSignal.C:
 					// Quit if shutdown detected.
 					return
 				}
 			}
-		case <-oc.shutdownSignal.C:
+		case <-oc.stopSignal.C:
 			// Quit if shutdown detected.
 			return
 		}

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -25,7 +26,7 @@ func (oc *Oncache) listenerProcess() {
 
 restart:
 	select {
-	case <-oc.shutdownSignal.C:
+	case <-oc.stopSignal.C:
 		return
 	default:
 	}
@@ -38,6 +39,7 @@ restart:
 	}
 
 	logInfo(fmt.Sprintf("Listening on port %d", oc.listenPort))
+	oc.initialListenerStarted.raise()
 	listenerExited := make(chan struct{})
 
 	go func() {
@@ -62,7 +64,7 @@ restart:
 		case <-listenerExited:
 			logError("Listener exited unexpectedly; restarting listener.")
 			goto restart
-		case <-oc.shutdownSignal.C:
+		case <-oc.stopSignal.C:
 			// Oncache is shutting down.
 			listener.Close()
 			<-listenerExited // Wait for above goroutine to exit before releasing resources.
@@ -77,11 +79,12 @@ func (oc *Oncache) handleConnection(conn net.Conn) {
 	oc.activeWork.Add(1) // removed in panic handler func
 	fromAddress := conn.RemoteAddr().String()
 	exiting := make(chan struct{})
+	logDebug(fmt.Sprintf("Accepted connection from %s.", fromAddress))
 
 	// Upon shutdown, close the connection.
 	go func() {
 		select {
-		case <-oc.shutdownSignal.C:
+		case <-oc.stopSignal.C:
 			// System is shutting down, close the connection.
 			conn.Close()
 		case <-exiting:
@@ -94,7 +97,9 @@ func (oc *Oncache) handleConnection(conn net.Conn) {
 	defer func() {
 		r := recover()
 		if r != nil {
-			logError(fmt.Sprintf("[%s] Connection handler panicked: %v", fromAddress, r))
+			logError(
+				fmt.Sprintf("[%s] Connection handler panicked: %v; %s",
+					fromAddress, r, string(debug.Stack())))
 		}
 		oc.activeWork.Done()
 	}()
@@ -105,12 +110,12 @@ func (oc *Oncache) handleConnection(conn net.Conn) {
 		return
 	}
 
-	reader := bufio.NewReader(decrypter)
-	firstline, err := reader.ReadString('\n')
-	if err != nil {
-		logError(fmt.Sprintf("Failed to read firstline from %s: %s", fromAddress, err))
+	scanner := bufio.NewScanner(decrypter)
+	if !scanner.Scan() {
+		logError(fmt.Sprintf("Failed to read firstline from %s: %v", fromAddress, scanner.Err()))
 		return
 	}
+	firstline := scanner.Text()
 
 	fields := strings.Fields(firstline)
 	if len(fields) < 2 {
@@ -128,14 +133,13 @@ func (oc *Oncache) handleConnection(conn net.Conn) {
 		fromAddress = fromAddress + "/" + host
 	}
 
-	scanner := bufio.NewScanner(decrypter)
 	for scanner.Scan() {
 		message := scanner.Text()
 		logDebug(fmt.Sprintf("[%s]: %s", fromAddress, message))
-		oc.handleMessageReceived(message)
+		oc.handleMessageReceived(host, message)
 	}
 
-	if !errors.Is(scanner.Err(), io.EOF) {
+	if err := scanner.Err(); err != nil && !errors.Is(scanner.Err(), io.EOF) {
 		logError(fmt.Sprintf("[%s] Connection closed with error: %s", fromAddress, scanner.Err().Error()))
 	}
 }

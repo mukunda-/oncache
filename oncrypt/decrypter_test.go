@@ -461,22 +461,22 @@ func TestDecryptEmptyRead(t *testing.T) {
 	}
 }
 
-func getRawEncryptedData(key []byte, data []byte) []byte {
-	client, remote := twoWayPipe()
+// func getRawEncryptedData(key []byte, data []byte) []byte {
+// 	client, remote := twoWayPipe()
 
-	go func() {
-		encrypter, err := oncrypt.EncryptStream(key, client)
-		if err != nil {
-			return
-		}
+// 	go func() {
+// 		encrypter, err := oncrypt.EncryptStream(key, client)
+// 		if err != nil {
+// 			return
+// 		}
 
-		encrypter.Write(data)
-		client.Close()
-	}()
-	decrypter, _ := oncrypt.DecryptStream(key, remote)
-	output, _ := io.ReadAll(decrypter)
-	return output
-}
+// 		encrypter.Write(data)
+// 		client.Close()
+// 	}()
+// 	decrypter, _ := oncrypt.DecryptStream(key, remote)
+// 	output, _ := io.ReadAll(decrypter)
+// 	return output
+// }
 
 func readAllWithRandomBuffers(t *testing.T, reader io.Reader) []byte {
 	t.Helper()
@@ -497,21 +497,21 @@ func readAllWithRandomBuffers(t *testing.T, reader io.Reader) []byte {
 	return document
 }
 
-func sendAllWithRandomLengthsSlowly(t *testing.T, writer io.Writer, data []byte) {
-	t.Helper()
-	read := 0
+// func sendAllWithRandomLengthsSlowly(t *testing.T, writer io.Writer, data []byte) {
+// 	t.Helper()
+// 	read := 0
 
-	for read < len(data) {
-		amount := rand.Intn(1000)
-		remaining := len(data) - read
-		if amount > remaining {
-			amount = remaining
-		}
-		writer.Write(data[read : read+amount])
-		read += amount
-		time.Sleep(time.Millisecond)
-	}
-}
+// 	for read < len(data) {
+// 		amount := rand.Intn(1000)
+// 		remaining := len(data) - read
+// 		if amount > remaining {
+// 			amount = remaining
+// 		}
+// 		writer.Write(data[read : read+amount])
+// 		read += amount
+// 		time.Sleep(time.Millisecond)
+// 	}
+// }
 
 func TestPartialWrites(t *testing.T) {
 	// [SPEC] The process should be resilient against arbitrary breaks in the data stream
@@ -602,35 +602,30 @@ func TestNulStripping(t *testing.T) {
 
 }
 
-// func TestBrokenStream(t *testing.T) {
-// 	// [SPEC] If the stream is broken, the reader should return an error.
+func TestBrokenStream(t *testing.T) {
+	// [SPEC] If the stream is broken, the reader should return an error.
+	key := makeTestKey()
 
-// 	key := makeTestKey()
-// 	sourceData := createRandomData(1000, "abc")
-// 	rawEncrypted := getRawEncryptedData(key, sourceData)
+	client, remote := twoWayPipe()
+	go func() {
+		oncrypt.EncryptStream(key, client)
 
-// 	client, remote := twoWayPipe()
-// 	go func() {
-// 		oncrypt.EncryptStream(key, client)
+		// Broken block (4/16 bytes)
+		client.Write([]byte("xxxx"))
+		client.Close()
+	}()
 
-// 		// Broken block (4/16 bytes)
-// 		client.Write([]byte("xxxx"))
-// 		client.Close()
-// 	}()
+	decrypter, err := oncrypt.DecryptStream(key, remote)
+	if err != nil {
+		t.Error(err)
+		return
+	}
 
-// 	decrypter, err := oncrypt.DecryptStream(key, remote)
-// 	if err != nil {
-// 		t.Error(err)
-// 		return
-// 	}
-
-// 	reader.Close()
-// 	{
-// 		_, err := decrypter.Read(make([]byte, 100))
-// 		if !errors.Is(err, io.ErrClosedPipe) {
-// 			t.Error("Error during read:", err)
-// 			return
-// 		}
-// 	}
-
-// }
+	{
+		_, err := decrypter.Read(make([]byte, 100))
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Error("Error during read:", err)
+			return
+		}
+	}
+}

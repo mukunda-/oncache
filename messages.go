@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -61,6 +62,17 @@ func (oc *Oncache) removePeer(address string) {
 //
 // Messages cannot contain line breaks. LF is the stream delimiter.
 func (oc *Oncache) DispatchMessage(channel string, message string) {
+	if channel == "" {
+		logError("Attempted to send message on empty channel " + string(debug.Stack()))
+		return
+	}
+
+	if strings.Contains(channel, "\n") || strings.Contains(message, "\n") {
+		logError("Attempted to send message with line break.")
+		return
+	}
+
+	logDebug("Dispatching message; chan=" + channel + " msg=" + message)
 	oc.outgoingMessageQueue <- channel + " " + message
 }
 
@@ -68,7 +80,7 @@ func (oc *Oncache) DispatchMessage(channel string, message string) {
 func (oc *Oncache) handleChannel1Message(message string) {
 	fields := strings.Fields(message)
 	if len(fields) < 1 {
-		logError("Invalid message on channel 1 (too short).")
+		logError("Received invalid message on channel 1 (too short).")
 		return
 	}
 
@@ -82,12 +94,12 @@ func (oc *Oncache) handleChannel1Message(message string) {
 		}
 		oc.deleteLocal(rest)
 	} else {
-		logError(fmt.Sprintf("Unknown command on channel 1: %s", message))
+		logError(fmt.Sprintf("Received unknown command on channel 1: %s", message))
 	}
 }
 
 // Called when a message is received from a peer.
-func (oc *Oncache) handleMessageReceived(fullMessage string) {
+func (oc *Oncache) handleMessageReceived(host string, fullMessage string) {
 	var channel, rest string
 	channel, rest, _ = strings.Cut(fullMessage, " ")
 	rest = strings.TrimSpace(rest)
@@ -96,7 +108,18 @@ func (oc *Oncache) handleMessageReceived(fullMessage string) {
 		oc.handleChannel1Message(rest)
 	}
 
-	// Check if channel has a callback and call that.
+	oc.subscriptionLock.Lock()
+	defer oc.subscriptionLock.Unlock()
+
+	channelSubs := oc.subscriptions[channel]
+	for _, sub := range channelSubs {
+		sub.handler(host, channel, rest)
+	}
+
+	fullSubs := oc.subscriptions[""]
+	for _, sub := range fullSubs {
+		sub.handler(host, channel, rest)
+	}
 }
 
 // Sending work process. This monitors the queue and broadcasts to peer channels.
@@ -110,7 +133,7 @@ func (oc *Oncache) messageSendProcess() {
 		select {
 		case message := <-oc.outgoingMessageQueue:
 			oc.broadcastMessage(message)
-		case <-oc.shutdownSignal.C:
+		case <-oc.stopSignal.C:
 			return
 		}
 	}
@@ -139,7 +162,7 @@ func (oc *Oncache) waitForMessagesToSend(sendQueue chan string) (string, bool) {
 	select {
 	case messageData = <-sendQueue:
 		// New message received.
-	case <-oc.shutdownSignal.C:
+	case <-oc.stopSignal.C:
 		// System is shutting down. Escape.
 		return "", false
 	}
@@ -202,7 +225,7 @@ restart:
 			logError(fmt.Sprintf("[%s] Error dialing %s; retrying in %d secs.", address, err, delay))
 			select {
 			case <-time.After(time.Duration(delay) * time.Second):
-			case <-oc.shutdownSignal.C:
+			case <-oc.stopSignal.C:
 				return
 			case <-oc.networkPeers[address].cancel.C:
 				return
@@ -231,7 +254,10 @@ restart:
 		}
 	}
 
+	// DEBUG: remove these logs
+	logDebug(fmt.Sprintf("writing messages to %s: %s", conn.RemoteAddr().String(), messages))
 	_, err := encrypter.Write([]byte(messages))
+	logDebug(fmt.Sprintf("writing messages to %s done", conn.RemoteAddr().String()))
 	if err != nil {
 		logError(fmt.Sprintf("[%s] Failed writing messages: %v; restarting.", address, err))
 		conn.Close()

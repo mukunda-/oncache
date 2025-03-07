@@ -70,10 +70,6 @@ type dcache struct {
 	cleanupPeriod     int32 // seconds
 	mutex             sync.RWMutex
 	nextCleanup       Unixtime
-
-	// Unixtime when this was created.
-	// cacheValue expiration time is "epoch + cv.expiration"
-	epoch int64
 }
 
 // No logging is done in Get/Set for performance reasons.
@@ -124,7 +120,7 @@ func (c *dcache) ResetLocal() {
 	c.data.Reset()
 }
 
-// Discard all keys.
+// Discard all keys in this cache across all nodes.
 func (c *dcache) Reset() {
 	c.ResetLocal()
 	c.parent.Delete(c.name)

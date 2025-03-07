@@ -3,6 +3,8 @@ package oncache_test
 import (
 	"fmt"
 	"math/rand"
+	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -25,7 +27,7 @@ func TestOncacheSingleNode(t *testing.T) {
 		MaxKeys: 2,
 	})
 
-	oc.Init(make([]byte, 16), "127.0.0.1:8850")
+	oc.Start(make([]byte, 16), "127.0.0.1:8850")
 
 	// [SPEC] The cache will only allow the specified amount of keys. Keys are evicted
 	//        according to the underlying eviction strategy. The default strategy is SIEVE.
@@ -56,29 +58,6 @@ func TestOncacheSingleNode(t *testing.T) {
 func TestOncacheCluster(t *testing.T) {
 	nodes := createCluster(24)
 	defer shutdownCluster(nodes)
-	// key := []byte("1234567890123456")
-
-	// // 24 nodes.
-	// nodes := make([]*oncache.Oncache, 24)
-
-	// //this may cause the test to fail from stdout spam slowing things down.
-	// //oncache.SetLogger(oncache.StdOutLogger)
-
-	// connects := []string{}
-	// for i := range nodes {
-	// 	nodes[i] = oncache.New()
-	// 	nodes[i].SetPort(14250 + i)
-	// 	host := "127.0.0.1"
-	// 	nodes[i].Init(key, host)
-	// 	hostWithPort := fmt.Sprintf("%s:%d", host, 14250+i)
-	// 	connects = append(connects, hostWithPort)
-	// }
-
-	// // [SPEC] Nodes are provided with a list of hostnames to communicate with. Nodes ignore
-	// //        their own hostname.
-	// for i := range nodes {
-	// 	nodes[i].Connect(connects)
-	// }
 
 	// For this test, we'll have QUICK access to a local database like this. Each node will
 	// read and write randomly to this database. They can confirm that they are in sync by
@@ -202,7 +181,7 @@ func createCluster(n int) []*oncache.Oncache {
 		nodes[i] = oncache.New()
 		nodes[i].SetPort(14250 + i)
 		host := "127.0.0.1"
-		nodes[i].Init(key, host)
+		nodes[i].Start(key, host)
 		hostWithPort := fmt.Sprintf("%s:%d", host, 14250+i)
 		connects = append(connects, hostWithPort)
 	}
@@ -213,32 +192,198 @@ func createCluster(n int) []*oncache.Oncache {
 		nodes[i].Connect(connects)
 	}
 
+	setupTimeout := time.Now().Add(time.Second * 10)
+	for i := range nodes {
+		for !nodes[i].ListenerStarted() {
+			if time.Now().After(setupTimeout) {
+				panic(fmt.Sprintf("node %d did not start within timeout", i))
+			}
+			time.Sleep(time.Millisecond * 1)
+		}
+	}
+
 	return nodes
 }
 
 func shutdownCluster(nodes []*oncache.Oncache) {
 	for i := range nodes {
-		nodes[i].Shutdown()
+		nodes[i].Stop()
 	}
 }
 
-func TestOncacheClusterMessages(t *testing.T) {
-	nodes := createCluster(6)
+func TestOncacheCustomMessage(t *testing.T) {
+	nodes := createCluster(2)
 	defer shutdownCluster(nodes)
 
-	nodes[0].Subscribe("test", func(host string, channel string, key string) {
-		// todo
+	done := make(chan struct{}, 5)
+	fail := make(chan string)
+
+	nodes[1].Subscribe("test1", func(host string, channel string, message string) {
+		t.Log("got msg", message)
+		if channel != "test1" {
+			fail <- "unexpected channel " + channel + " in test1 handler"
+		}
+		if !strings.Contains(message, "TEST") {
+			fail <- "message does not contain TEST"
+		}
+		if strings.Contains(message, "done") {
+			done <- struct{}{}
+		}
 	})
+
+	// [SPEC] When a message is dispatched, every other node receives it.
+
+	nodes[0].DispatchMessage("test1", "TEST")
+	nodes[0].DispatchMessage("test2", "TEST 1")
+	nodes[0].DispatchMessage("test1", "TEST done")
+	nodes[0].DispatchMessage("test1", "TEST 1")
+
+	select {
+	case <-time.After(time.Millisecond * 200):
+		t.Fatal("timeout")
+	case msg := <-fail:
+		t.Fatal(msg)
+	case <-done:
+	}
+
+	// [SPEC] Nodes do not receive their own messages.
+
+	nodes[0].DispatchMessage("test1", "TEST")
+	nodes[0].DispatchMessage("test2", "TEST 2")
+	nodes[0].DispatchMessage("test1", "TEST 1")
+	nodes[1].DispatchMessage("test1", "TEST done")
+
+	select {
+	case <-time.After(time.Millisecond * 200):
+	case msg := <-fail:
+		t.Fatal(msg)
+	case <-done:
+		t.Fatal("unexpected done")
+	}
 }
 
-// nodes := make([]*oncache.Oncache, 6)
+func TestSendAMessage(t *testing.T) {
+	// Basic test to confirm message passing from A to B is a success.
+	nodes := createCluster(2)
+	defer shutdownCluster(nodes)
 
-// connects := []string{}
-// for i := range nodes {
-// 	nodes[i] = oncache.New()
-// 	nodes[i].SetPort(14250 + i)
-// 	host := "127.0.0.1"
-// 	nodes[i].Init(key, host)
-// 	hostWithPort := fmt.Sprintf("%s:%d", host, 14250+i)
-// 	connects = append(connects, hostWithPort)
-// }
+	done := make(chan struct{})
+
+	// node0 -> TEST MESSAGE -> node1
+	// node1 -> TEST MESSAGE BOUNCE -> node0
+
+	nodes[1].Subscribe("", func(host string, channel string, message string) {
+		assert(t, message == "TEST MESSAGE")
+		assert(t, host == "127.0.0.1:14250")
+		assert(t, channel == "🚀")
+		nodes[1].DispatchMessage("👋", "TEST MESSAGE BOUNCE")
+	})
+
+	nodes[0].Subscribe("", func(host string, channel string, message string) {
+		assert(t, message == "TEST MESSAGE BOUNCE")
+		assert(t, host == "127.0.0.1:14251")
+		assert(t, channel == "👋")
+		close(done)
+	})
+
+	nodes[0].DispatchMessage("🚀", "TEST MESSAGE")
+
+	<-done
+}
+
+func TestOncacheMessagePassingCluster(t *testing.T) {
+	//oncache.SetLogger(oncache.StdOutLogger)
+	nodes := createCluster(10)
+	defer shutdownCluster(nodes)
+	rnd := rand.New(rand.NewSource(4))
+
+	// For this test, each node sends 100x3 messages. We verify that each message is
+	// received by every other node.
+
+	expected := make(map[string]struct{})
+	expectedLock := sync.Mutex{}
+
+	wg := sync.WaitGroup{}
+	wg.Add(len(nodes))
+
+	addExpected := func(fromNode int, channel string, message string) {
+		t.Helper()
+		expectedLock.Lock()
+		defer expectedLock.Unlock()
+
+		for n := range nodes {
+			if n != fromNode {
+				expected[fmt.Sprintf("to=%d chan=%s msg=%s", n, channel, message)] = struct{}{}
+				expected[fmt.Sprintf("to=%d chan= msg=%s", n, message)] = struct{}{}
+				wg.Add(2)
+			}
+		}
+	}
+
+	removeExpected := func(nodeIndex int, channel string, message string) {
+		t.Helper()
+		expectedLock.Lock()
+		defer expectedLock.Unlock()
+		key := fmt.Sprintf("to=%d chan=%s msg=%s", nodeIndex, channel, message)
+		_, ok := expected[key]
+		if !ok {
+			t.Error("missing expected message: " + key)
+		}
+		delete(expected, key)
+		wg.Done()
+	}
+
+	for nodeIndex, node := range nodes {
+		ni := nodeIndex
+		node.Subscribe("a", func(host string, channel string, message string) {
+			// Received message on channel A
+			removeExpected(ni, "a", message)
+		})
+		node.Subscribe("b", func(host string, channel string, message string) {
+			// Received message on channel B
+			removeExpected(ni, "b", message)
+		})
+		node.Subscribe("c", func(host string, channel string, message string) {
+			// Received message on channel C
+			removeExpected(ni, "c", message)
+		})
+		node.Subscribe("", func(host string, channel string, message string) {
+			// Received message on any channel
+			removeExpected(ni, "", message)
+		})
+	}
+
+	for nodeIndex, node := range nodes {
+		go func(nodeIndex int, node *oncache.Oncache) {
+			for i := 0; i < 100; i++ {
+				addExpected(nodeIndex, "a", fmt.Sprintf("%d-a%d", nodeIndex, i))
+				addExpected(nodeIndex, "b", fmt.Sprintf("%d-b%d", nodeIndex, i))
+				addExpected(nodeIndex, "c", fmt.Sprintf("%d-c%d", nodeIndex, i))
+				node.DispatchMessage("a", fmt.Sprintf("%d-a%d", nodeIndex, i))
+				node.DispatchMessage("b", fmt.Sprintf("%d-b%d", nodeIndex, i))
+				node.DispatchMessage("c", fmt.Sprintf("%d-c%d", nodeIndex, i))
+				time.Sleep(time.Microsecond*200 + time.Millisecond*time.Duration(rnd.Intn(3)))
+			}
+			wg.Done()
+		}(nodeIndex, node)
+	}
+
+	wg.Wait()
+
+	if len(expected) > 0 {
+		t.Error("test integrity failed; length should end as zero")
+	}
+}
+
+func TestNetListenBehavior(t *testing.T) {
+	// Just want to make sure that net.Listen is what opens the port (and not
+	// listener.Accept).
+	listener, _ := net.Listen("tcp", "127.0.0.1:22345")
+	defer listener.Close()
+
+	conn, err := net.Dial("tcp", "127.0.0.1:22345")
+	if err != nil {
+		t.Error(err)
+	}
+	defer conn.Close()
+}
