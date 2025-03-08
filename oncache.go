@@ -317,17 +317,3 @@ func (oc *Oncache) cleaningProcess() {
 		}
 	}
 }
-
-// Keep track of what caches are registered in order to find them by name during message
-// handling. Does nothing and logs an error if the cache already exists.
-func (oc *Oncache) registerCache(name string, cache Cache) {
-	oc.cachesLock.Lock()
-	defer oc.cachesLock.Unlock()
-
-	if _, ok := oc.caches[name]; ok {
-		logError("Tried to create cache \"" + name + "\" which already exists.")
-		return
-	}
-
-	oc.caches[name] = cache
-}
