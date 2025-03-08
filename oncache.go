@@ -331,24 +331,3 @@ func (oc *Oncache) registerCache(name string, cache Cache) {
 
 	oc.caches[name] = cache
 }
-
-// Get a cache by name. Returns nil if the cache does not exist. Create caches with
-// [Oncache.NewCache].
-func (oc *Oncache) GetCache(name string) Cache {
-	oc.cachesLock.RLock()
-	defer oc.cachesLock.RUnlock()
-	return oc.caches[name]
-}
-
-// Returns a copy of the caches map, so it can be iterated over safely.
-func (oc *Oncache) GetAllCaches() map[string]Cache {
-	oc.cachesLock.RLock()
-	defer oc.cachesLock.RUnlock()
-
-	m := make(map[string]Cache)
-	for k, v := range oc.caches {
-		m[k] = v
-	}
-
-	return m
-}

@@ -372,6 +372,10 @@ restart:
 				return
 			}
 
+			// add the work here before the goroutine starts (otherwise there is a chance
+			// that we might reach 0 work during shutdown before this is added, and cause a
+			// panic.
+			oc.activeWork.Add(1)
 			go oc.handleConnection(conn)
 		}
 	}()
@@ -393,8 +397,18 @@ restart:
 // Handle a connection. Decrypt the stream, register the client, and monitor for messages.
 // Complete messages are delivered to the message handler.
 func (oc *Oncache) handleConnection(conn net.Conn) {
-	oc.activeWork.Add(1) // removed in panic handler func
 	fromAddress := conn.RemoteAddr().String()
+
+	defer func() {
+		r := recover()
+		if r != nil {
+			logError(
+				fmt.Sprintf("[%s] Connection handler panicked: %v; %s",
+					fromAddress, r, string(debug.Stack())))
+		}
+		oc.activeWork.Done() // work group is completed here.
+	}()
+
 	exiting := make(chan struct{})
 	logDebug(fmt.Sprintf("Accepted connection from %s.", fromAddress))
 
@@ -411,15 +425,6 @@ func (oc *Oncache) handleConnection(conn net.Conn) {
 	defer close(exiting) // Stop the above goroutine upon exiting this function.
 
 	defer conn.Close() // Make sure the connection is closed if we return from this function.
-	defer func() {
-		r := recover()
-		if r != nil {
-			logError(
-				fmt.Sprintf("[%s] Connection handler panicked: %v; %s",
-					fromAddress, r, string(debug.Stack())))
-		}
-		oc.activeWork.Done()
-	}()
 
 	decrypter, err := oncrypt.DecryptStream(oc.encryptionKey, conn)
 	if err != nil {

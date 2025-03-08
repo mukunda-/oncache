@@ -664,6 +664,8 @@ func restoreTime() {
 }
 
 func TestClusterUpDownPorts(t *testing.T) {
+	// This test has caught wait group misuse before. But basically we just want to make
+	// sure that the ports are cleaned up properly, especially between tests.
 	for i := 0; i < 100; i++ {
 		nodes := createCluster(3)
 		shutdownCluster(nodes)
@@ -1017,6 +1019,7 @@ func TestBadKey(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		if i != 16 && i != 24 && i != 32 {
 			node := oncache.New()
+			defer node.Stop()
 			node.SetPort(14250)
 			assert(t,
 				errors.Is(node.Start(bytes.Repeat([]byte{0}, i), "127.0.0.1"),
@@ -1034,8 +1037,10 @@ func TestListenerCrash(t *testing.T) {
 	logger.Install()
 	defer logger.Uninstall()
 
-	nodes := createCluster(1)
-	defer shutdownCluster(nodes)
+	node := oncache.New()
+	node.SetPort(14250)
+	node.Start([]byte("1234567890123456"), "127.0.0.1")
+	defer node.Stop()
 
 	time.Sleep(time.Millisecond * 100)
 
@@ -1043,7 +1048,7 @@ func TestListenerCrash(t *testing.T) {
 
 	// This should cancel the restart immediately.
 	startOfStop := time.Now()
-	nodes[0].Stop()
+	node.Stop()
 	endOfStop := time.Now()
 	assert(t, endOfStop.Sub(startOfStop) < time.Second)
 }
@@ -1078,4 +1083,21 @@ func TestListenerCrashRecover(t *testing.T) {
 	waitFor(t, func() bool {
 		return node.ListenerStarted()
 	}, time.Second*1)
+}
+
+func TestNoExpiration(t *testing.T) {
+	nodes := createCluster(1)
+	defer shutdownCluster(nodes)
+
+	// [SPEC] When a negative duration is passed to the NewCacheOptions, the default
+	// expiration is set to never expire.
+
+	cache := nodes[0].NewCache("test", oncache.NewCacheOptions{
+		DefaultExpiration: oncache.NeverExpires,
+	})
+
+	cache.Set("key1", "value1")
+	useTime(9999999999)
+	defer restoreTime()
+	assert(t, cache.Get("key1") == "value1")
 }
