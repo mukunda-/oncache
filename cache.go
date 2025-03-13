@@ -10,9 +10,11 @@ import (
 	"sync"
 	"time"
 
+	"go.mukunda.com/oncache/internal/mapcache"
 	"go.mukunda.com/oncache/sieve"
 )
 
+const UnlimitedKeys = -1
 const NeverExpires = time.Duration(-1)
 const NeverCleans = time.Duration(-1)
 const DefaultExpiration = 5 * time.Minute
@@ -64,10 +66,19 @@ type Cache interface {
 	NumKeys() int
 }
 
+type cacheData interface {
+	Get(key string) any
+	Set(key string, value any, ttl time.Duration)
+	Delete(key string)
+	Reset()
+	Clean()
+	NumKeys() int
+}
+
 type dcache struct {
 	parent            *Oncache
 	name              string
-	data              *sieve.Sieve
+	data              cacheData
 	maxKeys           int
 	defaultExpiration int32 // seconds
 	cleanupPeriod     int32 // seconds
@@ -163,9 +174,8 @@ func (c *dcache) NumKeys() int {
 
 // Options for NewCache. All options can be `nil` which indicates the default value.
 type NewCacheOptions struct {
-	// The max amount of keys the cache can hold. Must be 1-65535. Default is 1000.
-	// Currently there is no option to have "unlimited" keys, but an additional
-	// implementation may support that in the future.
+	// The max amount of keys the cache can hold. Must be -1 or 1-65535. Default is 1000.
+	// -1 = unlimited keys.
 	MaxKeys int
 
 	// The default period before values are considered stale.
@@ -202,7 +212,11 @@ func (oc *Oncache) NewCache(name string, options ...NewCacheOptions) Cache {
 	for _, opt := range options {
 		if opt.MaxKeys != 0 {
 			cache.maxKeys = opt.MaxKeys
+			if cache.maxKeys < 0 {
+				cache.maxKeys = 0
+			}
 		}
+
 		if opt.DefaultExpiration != 0 {
 			cache.defaultExpiration = int32(opt.DefaultExpiration.Seconds())
 			if opt.DefaultExpiration < 0 {
@@ -212,6 +226,7 @@ func (oc *Oncache) NewCache(name string, options ...NewCacheOptions) Cache {
 				cache.defaultExpiration = 1
 			}
 		}
+
 		if opt.CleanupPeriod != 0 {
 			cache.cleanupPeriod = int32(opt.CleanupPeriod.Seconds())
 			if opt.CleanupPeriod < 0 {
@@ -231,7 +246,12 @@ func (oc *Oncache) NewCache(name string, options ...NewCacheOptions) Cache {
 			cache.cleanupPeriod+cache.cleanupPeriod,
 		))
 
-	cache.data = sieve.NewSieve(uint16(cache.maxKeys))
+	if cache.maxKeys == 0 {
+		cache.data = mapcache.New()
+	} else {
+		cache.data = sieve.NewSieve(uint16(cache.maxKeys))
+	}
+
 	cache.nextCleanup = Unixtime(time.Now().Unix()) + int64(cache.cleanupPeriod)
 	oc.registerCache(name, cache)
 	return cache

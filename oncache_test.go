@@ -1101,3 +1101,22 @@ func TestNoExpiration(t *testing.T) {
 	defer restoreTime()
 	assert(t, cache.Get("key1") == "value1")
 }
+
+func TestUnlimitedKeys(t *testing.T) {
+	nodes := createCluster(1)
+	defer shutdownCluster(nodes)
+
+	// [SPEC] When MaxKeys is set to UnlimitedKeys, the cache will accept an unlimited
+	//        number of keys without evicting any.
+
+	cache := nodes[0].NewCache("test", oncache.NewCacheOptions{
+		MaxKeys: oncache.UnlimitedKeys,
+	})
+
+	for i := 0; i < 10000; i++ {
+		cache.Set(fmt.Sprintf("key%d", i), i)
+	}
+
+	assert(t, cache.NumKeys() == 10000)
+
+}
